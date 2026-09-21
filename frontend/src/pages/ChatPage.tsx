@@ -23,7 +23,7 @@ function normalizeRole(role: string): 'user' | 'assistant' {
   return 'user'
 }
 
-type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number }
+type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number; model?: string }
 
 function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
   const [open, setOpen] = useState(false)
@@ -463,7 +463,7 @@ export default function ChatPage() {
             return next
           }
           if (ev.type === 'done') {
-            return [...prev.slice(0, idx), { role: 'assistant', content: ev.response, steps: ev.steps ?? [], tokens: ev.tokens, tps: ev.tps, timestamp: Date.now() }]
+            return [...prev.slice(0, idx), { role: 'assistant', content: ev.response, steps: ev.steps ?? [], tokens: ev.tokens, tps: ev.tps, timestamp: Date.now(), model: ev.model }]
           }
           if (ev.type === 'error') {
             const next = [...prev]
@@ -629,27 +629,32 @@ export default function ChatPage() {
                         </p>
                       )}
                     </div>
-                  ) : (
-                    <div className="max-w-[80%] sm:max-w-[70%] space-y-2 min-w-0">
-                      <p className="text-[10px] font-semibold tracking-wider text-orange-400 mb-1 uppercase">Bigship Agent</p>
-                      <StepTrace steps={msg.steps} live={streamingActive && idx === messages.length - 1} />
-                      {msg.content && (
-                        <div className="px-4 py-2 bg-(--bg-secondary) text-(--text-secondary)">
-                          <MarkdownContent content={msg.content} />
-                        </div>
-                      )}
-                      {msg.tokens != null && msg.tps != null && (
-                        <p className="text-[10px] text-(--text-tertiary)">
-                          {msg.tokens} tokens · {msg.tps} TPS
-                        </p>
-                      )}
-                      {msg.timestamp && (
-                        <p className="text-[10px] text-(--text-tertiary)">
-                          {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </p>
-                      )}
-                    </div>
-                  )}
+                    ) : (
+                      <div className="max-w-[80%] sm:max-w-[70%] space-y-2 min-w-0">
+                        <p className="text-[10px] font-semibold tracking-wider text-orange-400 mb-1 uppercase">Bigship Agent</p>
+                        <StepTrace steps={msg.steps} live={streamingActive && idx === messages.length - 1} />
+                        {msg.content && (
+                          <div className="px-4 py-2 bg-(--bg-secondary) text-(--text-secondary)">
+                            <MarkdownContent content={msg.content} />
+                          </div>
+                        )}
+                        {msg.tokens != null && msg.tps != null && (
+                          <p className="text-[10px] text-(--text-tertiary)">
+                            {msg.tokens} tokens · {msg.tps} TPS
+                          </p>
+                        )}
+                        {msg.model && (
+                          <p className="text-[10px] text-(--text-tertiary)">
+                            {msg.model}
+                          </p>
+                        )}
+                        {msg.timestamp && (
+                          <p className="text-[10px] text-(--text-tertiary)">
+                            {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                          </p>
+                        )}
+                      </div>
+                    )}
                 </div>
               ))
             )}

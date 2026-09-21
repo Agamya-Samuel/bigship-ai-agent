@@ -40,6 +40,7 @@ export type AgentStep =
 export interface ChatResponse {
   response: string
   steps?: AgentStep[]
+  model?: string
 }
 
 export type StreamEvent =
@@ -49,5 +50,5 @@ export type StreamEvent =
   | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown>; tool_call_id?: string }
   | { type: 'tool_result'; tool_call_id: string; name: string; result: string }
-  | { type: 'done'; response: string; steps: AgentStep[]; tokens?: number; tps?: number }
+  | { type: 'done'; response: string; steps: AgentStep[]; tokens?: number; tps?: number; model?: string }
   | { type: 'error'; detail?: string }
