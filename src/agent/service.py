@@ -241,6 +241,8 @@ def delete_session(
     try:
         conn = sqlite3.connect(settings.checkpoint_db_path, check_same_thread=False)
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
             SqliteSaver(conn).delete_thread(thread_id)
         finally:
             conn.close()
@@ -257,19 +259,24 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 
 def _get_history(thread_id: str, db_path: str, store: EncryptedCredentialStore) -> list:
     conn = sqlite3.connect(db_path, check_same_thread=False)
-    saver = SqliteSaver(conn)
-    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
     try:
-        checkpoint = saver.get(config)
-    except Exception:  # noqa: BLE001
-        return []
-    if not (checkpoint and isinstance(checkpoint.get("channel_values"), dict)):
-        return []
-    raw = checkpoint["channel_values"].get("messages", [])
-    # Orphan detection must run on the full message list (ToolMessages included),
-    # otherwise every tool call looks orphaned and the thread gets wiped.
-    cleaned = _strip_orphaned_tool_calls(raw, saver, thread_id)
-    return [m for m in cleaned if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        saver = SqliteSaver(conn)
+        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        try:
+            checkpoint = saver.get(config)
+        except Exception:  # noqa: BLE001
+            return []
+        if not (checkpoint and isinstance(checkpoint.get("channel_values"), dict)):
+            return []
+        raw = checkpoint["channel_values"].get("messages", [])
+        # Orphan detection must run on the full message list (ToolMessages included),
+        # otherwise every tool call looks orphaned and the thread gets wiped.
+        cleaned = _strip_orphaned_tool_calls(raw, saver, thread_id)
+        return [m for m in cleaned if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
+    finally:
+        conn.close()
 
 
 def _strip_orphaned_tool_calls(messages: list, saver: SqliteSaver, thread_id: str) -> list:

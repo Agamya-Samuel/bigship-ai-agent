@@ -27,6 +27,11 @@ def build_graph(checkpoint_db_path: str):  # type: ignore[no-untyped-def]
     agent = create_react_agent(llm, tool_node)
 
     conn = sqlite3.connect(checkpoint_db_path, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except Exception:  # noqa: BLE001
+        pass
     checkpointer = SqliteSaver(conn)
     agent.checkpointer = checkpointer
 
