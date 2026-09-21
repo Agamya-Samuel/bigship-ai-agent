@@ -54,7 +54,8 @@ class EncryptedCredentialStore:
                 thread_id TEXT UNIQUE NOT NULL,
                 label TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
-                last_used_at TEXT NOT NULL DEFAULT (datetime('now'))
+                last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
+                model TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_account_id
@@ -63,7 +64,11 @@ class EncryptedCredentialStore:
                 ON sessions(thread_id);
             """
         )
-        self._conn.commit()
+        try:
+            self._conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
+            self._conn.commit()
+        except Exception:  # noqa: BLE001
+            pass
 
     def _encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()
@@ -150,7 +155,7 @@ class EncryptedCredentialStore:
     def get_sessions(self, account_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, thread_id, label, created_at, last_used_at "
+                "SELECT id, thread_id, label, created_at, last_used_at, model "
                 "FROM sessions WHERE account_id = ? ORDER BY last_used_at DESC",
                 (account_id,),
             ).fetchall()
@@ -160,7 +165,7 @@ class EncryptedCredentialStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, account_id, thread_id, label, created_at, "
-                "last_used_at FROM sessions WHERE thread_id = ?",
+                "last_used_at, model FROM sessions WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -238,6 +243,14 @@ class EncryptedCredentialStore:
             self._conn.execute(
                 "UPDATE sessions SET last_used_at = ? WHERE thread_id = ?",
                 (self._now(), thread_id),
+            )
+            self._conn.commit()
+
+    def update_session_model(self, thread_id: str, model: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET model = ? WHERE thread_id = ?",
+                (model, thread_id),
             )
             self._conn.commit()
 

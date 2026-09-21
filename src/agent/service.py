@@ -155,6 +155,7 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     response: str
     steps: list[dict] = []
+    model: str | None = None
 
 
 # ==================== AUTH ====================
@@ -328,6 +329,15 @@ def _serialize_tool_calls(msg: AIMessage) -> list[dict]:
     ]
 
 
+def _get_model_from_message(msg: Any) -> str | None:
+    metadata = getattr(msg, "response_metadata", None)
+    if isinstance(metadata, dict):
+        model = metadata.get("model_name") or metadata.get("model_id") or metadata.get("model")
+        if isinstance(model, str) and model:
+            return model
+    return None
+
+
 def _is_tool_echo(text: str) -> bool:
     s = text.strip()
     return (
@@ -434,6 +444,13 @@ def _get_display_history(
     thread_id: str, db_path: str, store: EncryptedCredentialStore
 ) -> list[dict]:
     raw_messages = _get_history(thread_id, db_path, store)
+    model = None
+    try:
+        session = store.get_session(thread_id)
+        if isinstance(session, dict):
+            model = session.get("model")
+    except Exception:  # noqa: BLE001
+        model = None
 
     merged: list[dict] = []
     turn: list = []
@@ -441,14 +458,14 @@ def _get_display_history(
         if isinstance(msg, HumanMessage):
             turn_data = _finalize_turn(_collect_turn_events(turn))
             if turn_data["content"] or turn_data["steps"]:
-                merged.append({"role": "assistant", **turn_data})
+                merged.append({"role": "assistant", **turn_data, "model": model})
             merged.append({"role": "user", "content": getattr(msg, "content", "") or ""})
             turn = []
         else:
             turn.append(msg)
     turn_data = _finalize_turn(_collect_turn_events(turn))
     if turn_data["content"] or turn_data["steps"]:
-        merged.append({"role": "assistant", **turn_data})
+        merged.append({"role": "assistant", **turn_data, "model": model})
     return merged
 
 
@@ -488,7 +505,12 @@ def chat(
     if not turn_data["content"]:
         turn_data["content"] = str(getattr(last_message, "content", "") or "")
     store._touch_session(req.thread_id)
-    return ChatResponse(response=turn_data["content"], steps=turn_data["steps"])
+    response_model = _get_model_from_message(last_message) or settings.llm_model
+    try:
+        store.update_session_model(req.thread_id, response_model)
+    except Exception:  # noqa: BLE001
+        pass
+    return ChatResponse(response=turn_data["content"], steps=turn_data["steps"], model=response_model)
 
 
 @app.post("/chat/stream")
@@ -521,6 +543,7 @@ def chat_stream(
         collected_ais: list[AIMessage] = []
         start_time = __import__("time").monotonic()
         total_output_tokens = 0
+        response_model: str | None = None
         try:
             yield _sse({"type": "start"})
             for mode, payload in graph.stream(
@@ -534,6 +557,8 @@ def chat_stream(
                         continue
                     if not isinstance(meta, dict) or meta.get("langgraph_node") != "agent":
                         continue
+                    if response_model is None:
+                        response_model = _get_model_from_message(chunk)
                     usage = getattr(chunk, "usage_metadata", None)
                     if isinstance(usage, dict):
                         output_tokens = usage.get("output_tokens")
@@ -595,6 +620,11 @@ def chat_stream(
             if not turn_data["content"] and collected_ais:
                 turn_data["content"] = _message_text(collected_ais[-1]).strip()
             store._touch_session(req.thread_id)
+            if response_model:
+                try:
+                    store.update_session_model(req.thread_id, response_model)
+                except Exception:  # noqa: BLE001
+                    pass
             elapsed = max(__import__("time").monotonic() - start_time, 0.001)
             tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None
             yield _sse(
@@ -604,6 +634,7 @@ def chat_stream(
                     "steps": turn_data["steps"],
                     "tokens": total_output_tokens or None,
                     "tps": tps,
+                    "model": response_model,
                 }
             )
         except Exception:  # noqa: BLE001
