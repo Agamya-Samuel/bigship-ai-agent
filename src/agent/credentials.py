@@ -13,6 +13,8 @@ from bigship_sdk import BigshipClient
 from bigship_sdk.config import BigshipConfig
 from cryptography.fernet import Fernet
 
+from agent.config import settings
+
 
 class SessionNotFoundError(Exception):
     pass
@@ -22,35 +24,10 @@ class EncryptionKeyMissingError(Exception):
     pass
 
 
-def _hash_password(password: str) -> str:
-    pw_bytes = password.encode()[:72]
-    return _bcrypt.hashpw(pw_bytes, _bcrypt.gensalt()).decode()
-
-
-def _verify_password(password: str, password_hash: str) -> bool:
-    pw_bytes = password.encode()[:72]
-    try:
-        return _bcrypt.checkpw(pw_bytes, password_hash.encode())
-    except (ValueError, TypeError):
-        return False
-
-
-def _get_fernet() -> Fernet:
-    key = os.environ.get("CREDENTIAL_ENCRYPTION_KEY")
-    if not key:
-        raise EncryptionKeyMissingError("CREDENTIAL_ENCRYPTION_KEY env var is required")
-    try:
-        return Fernet(key.encode())
-    except Exception as exc:
-        raise EncryptionKeyMissingError(
-            "CREDENTIAL_ENCRYPTION_KEY must be a valid base64-encoded 32-byte key"
-        ) from exc
-
-
 class EncryptedCredentialStore:
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
-        self._fernet = _get_fernet()
+        self._fernet = _make_fernet(settings.credential_encryption_key)
         self._client_cache: dict[str, BigshipClient] = {}
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
@@ -58,8 +35,6 @@ class EncryptedCredentialStore:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._init_db()
-        self._last_touch: dict[str, float] = {}
-        self._touch_interval = 60.0
 
     def _init_db(self) -> None:
         self._conn.executescript(
@@ -106,52 +81,6 @@ class EncryptedCredentialStore:
         return hashlib.sha256(os.urandom(16)).hexdigest()[:32]
 
     def create_account(self, user_name: str, password: str, access_key: str) -> str:
-        with self._lock:
-            account_id = self._generate_id()
-            password_hash = _hash_password(password)
-            access_key_encrypted = self._encrypt(access_key)
-            password_encrypted = self._encrypt(password)
-            try:
-                self._conn.execute(
-                    "INSERT INTO accounts "
-                    "(id, user_name, password_hash, access_key_encrypted, "
-                    "password_encrypted) VALUES (?, ?, ?, ?, ?)",
-                    (
-                        account_id,
-                        user_name,
-                        password_hash,
-                        access_key_encrypted,
-                        password_encrypted,
-                    ),
-                )
-            except sqlite3.IntegrityError as exc:
-                raise ValueError(f"Account with user_name '{user_name}' already exists") from exc
-            self._conn.commit()
-            return account_id
-
-    def verify_login(self, user_name: str, password: str) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT id, password_hash FROM accounts WHERE user_name = ?",
-                (user_name,),
-            ).fetchone()
-        if row is None:
-            return None
-        if not _verify_password(password, row["password_hash"]):
-            return None
-        return str(row["id"])
-
-    def _get_account_id(self, user_name: str) -> str:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT id FROM accounts WHERE user_name = ?",
-                (user_name,),
-            ).fetchone()
-        if row is None:
-            raise SessionNotFoundError(f"Account not found: {user_name}")
-        return str(row["id"])
-
-    def _upsert_account(self, user_name: str, password: str, access_key: str) -> str:
         password_hash = _hash_password(password)
         access_key_encrypted = self._encrypt(access_key)
         password_encrypted = self._encrypt(password)
@@ -178,23 +107,45 @@ class EncryptedCredentialStore:
                 account_id = row["id"]
                 self._conn.execute(
                     "UPDATE accounts SET password_hash = ?, "
-                    "access_key_encrypted = ?, password_encrypted = ? WHERE id = ?",
+                    "access_key_encrypted = ?, password_encrypted = ? "
+                    "WHERE id = ?",
                     (password_hash, access_key_encrypted, password_encrypted, account_id),
                 )
             self._conn.commit()
+        self._evict_account_client(account_id)
         return account_id
 
-    def create_session(self, thread_id: str, user_name: str, password: str, access_key: str) -> str:
-        account_id = self._upsert_account(user_name, password, access_key)
+    def verify_login(self, user_name: str, password: str) -> str | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, password_hash FROM accounts WHERE user_name = ?",
+                (user_name,),
+            ).fetchone()
+        if row is None:
+            return None
+        if not _verify_password(password, row["password_hash"]):
+            return None
+        return str(row["id"])
+
+    def get_account(self, account_id: str) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT id, user_name, created_at FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+        if row is None:
+            raise SessionNotFoundError(f"Account not found: {account_id}")
+        return dict(row)
+
+    def create_session(self, account_id: str, thread_id: str, label: str = "") -> None:
         with self._lock:
             session_id = self._generate_id()
             self._conn.execute(
                 "INSERT INTO sessions (id, account_id, thread_id, label) VALUES (?, ?, ?, ?)",
-                (session_id, account_id, thread_id, ""),
+                (session_id, account_id, thread_id, label),
             )
             self._conn.commit()
         self._touch_session(thread_id)
-        return session_id
 
     def get_sessions(self, account_id: str) -> list[dict[str, Any]]:
         with self._lock:
@@ -218,27 +169,38 @@ class EncryptedCredentialStore:
         with self._lock:
             self._conn.execute("DELETE FROM sessions WHERE thread_id = ?", (thread_id,))
             self._conn.commit()
-        self._evict_client(thread_id)
+        self._evict_thread_client(thread_id)
 
-    def _evict_client(self, thread_id: str) -> None:
+    def _evict_thread_client(self, thread_id: str) -> None:
         client = self._client_cache.pop(thread_id, None)
         if client is not None:
-            try:
-                client.close()
-            except Exception:
-                pass
+            self._close_client(client)
 
-    def _get_account_credentials(self, account_id: str) -> tuple[str, str]:
+    def _evict_account_client(self, account_id: str) -> None:
+        client = self._client_cache.pop(f"account:{account_id}", None)
+        if client is not None:
+            self._close_client(client)
+
+    @staticmethod
+    def _close_client(client: BigshipClient) -> None:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+    def _get_account_credentials(self, account_id: str) -> tuple[str, str, str]:
         with self._lock:
             row = self._conn.execute(
-                "SELECT access_key_encrypted, password_encrypted FROM accounts WHERE id = ?",
+                "SELECT user_name, access_key_encrypted, password_encrypted "
+                "FROM accounts WHERE id = ?",
                 (account_id,),
             ).fetchone()
         if row is None:
             raise SessionNotFoundError(f"Account not found: {account_id}")
+        user_name = str(row["user_name"])
         access_key = self._decrypt(row["access_key_encrypted"])
         password = self._decrypt(row["password_encrypted"])
-        return access_key, password
+        return user_name, access_key, password
 
     def get_or_create_client(self, thread_id: str) -> BigshipClient:
         with self._lock:
@@ -252,38 +214,26 @@ class EncryptedCredentialStore:
             raise SessionNotFoundError(f"No active session for thread_id: {thread_id}")
 
         account_id = session["account_id"]
-        access_key, password = self._get_account_credentials(account_id)
-        user_name = self._get_user_name(account_id)
-
-        config = BigshipConfig(
-            base_url="https://api.bigship.direct",
-            user_name=user_name,
-            password=password,
-            access_key=access_key,
-        )
-        client = BigshipClient(config)
+        user_name, access_key, password = self._get_account_credentials(account_id)
+        client = BigshipClient(_bigship_config(user_name, password, access_key))
 
         with self._lock:
-            self._client_cache[thread_id] = client
+            existing = self._client_cache.get(thread_id)
+            if existing is not None:
+                self._close_client(client)
+                client = existing
+            else:
+                self._client_cache[thread_id] = client
         self._touch_session(thread_id)
         return client
 
-    def _get_user_name(self, account_id: str) -> str:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT user_name FROM accounts WHERE id = ?",
-                (account_id,),
-            ).fetchone()
-        if row is None:
-            raise SessionNotFoundError(f"Account not found: {account_id}")
-        return str(row["user_name"])
+    def build_client_from_credentials(
+        self, user_name: str, password: str, access_key: str
+    ) -> BigshipClient:
+        """Build a fresh BigshipClient from raw credentials (for login validation)."""
+        return BigshipClient(_bigship_config(user_name, password, access_key))
 
     def _touch_session(self, thread_id: str) -> None:
-        now = time.time()
-        last_touch = self._last_touch.get(thread_id, 0.0)
-        if now - last_touch < self._touch_interval:
-            return
-        self._last_touch[thread_id] = now
         with self._lock:
             self._conn.execute(
                 "UPDATE sessions SET last_used_at = ? WHERE thread_id = ?",
@@ -295,7 +245,7 @@ class EncryptedCredentialStore:
         cutoff = time.time() - max_idle_seconds
         with self._lock:
             rows = self._conn.execute("SELECT thread_id, last_used_at FROM sessions").fetchall()
-            to_evict = []
+            to_evict: list[str] = []
             for row in rows:
                 try:
                     last_used = datetime.fromisoformat(row["last_used_at"]).timestamp()
@@ -304,17 +254,47 @@ class EncryptedCredentialStore:
                 if last_used < cutoff:
                     to_evict.append(row["thread_id"])
         for thread_id in to_evict:
-            self._evict_client(thread_id)
+            self._evict_thread_client(thread_id)
 
     def close(self) -> None:
         with self._lock:
             for client in self._client_cache.values():
-                try:
-                    client.close()
-                except Exception:
-                    pass
+                self._close_client(client)
             self._client_cache.clear()
         self._conn.close()
+
+
+def _make_fernet(key: str) -> Fernet:
+    if not key:
+        raise EncryptionKeyMissingError("CREDENTIAL_ENCRYPTION_KEY is required")
+    try:
+        return Fernet(key.encode())
+    except Exception as exc:
+        raise EncryptionKeyMissingError(
+            "CREDENTIAL_ENCRYPTION_KEY must be a valid base64-encoded 32-byte key"
+        ) from exc
+
+
+def _hash_password(password: str) -> str:
+    pw_bytes = password.encode("utf-8")[:72]
+    return _bcrypt.hashpw(pw_bytes, _bcrypt.gensalt()).decode()
+
+
+def _verify_password(password: str, password_hash: str) -> bool:
+    pw_bytes = password.encode("utf-8")[:72]
+    try:
+        return _bcrypt.checkpw(pw_bytes, password_hash.encode())
+    except (ValueError, TypeError):
+        return False
+
+
+def _bigship_config(user_name: str, password: str, access_key: str) -> BigshipConfig:
+    return BigshipConfig(
+        base_url="https://api.bigship.direct",
+        user_name=user_name,
+        password=password,
+        access_key=access_key,
+    )
 
 
 credential_store: EncryptedCredentialStore | None = None
