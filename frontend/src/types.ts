@@ -43,11 +43,11 @@ export interface ChatResponse {
 }
 
 export type StreamEvent =
-  | { type: 'start'; model?: string }
+  | { type: 'start' }
   | { type: 'text_delta'; text: string }
   | { type: 'reasoning_delta'; text: string }
   | { type: 'reasoning'; text: string }
   | { type: 'tool_call'; name: string; args: Record<string, unknown>; tool_call_id?: string }
   | { type: 'tool_result'; tool_call_id: string; name: string; result: string }
-  | { type: 'done'; response: string; steps: AgentStep[]; tokens?: number; tps?: number; model?: string }
+  | { type: 'done'; response: string; steps: AgentStep[]; tokens?: number; tps?: number }
   | { type: 'error'; detail?: string }

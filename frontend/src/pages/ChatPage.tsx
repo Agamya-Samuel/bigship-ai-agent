@@ -23,7 +23,7 @@ function normalizeRole(role: string): 'user' | 'assistant' {
   return 'user'
 }
 
-type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number; model?: string }
+type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number }
 
 function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
   const [open, setOpen] = useState(false)
