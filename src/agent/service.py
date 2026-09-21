@@ -154,64 +154,651 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     response: str
+    steps: list[dict] = []
 
 
-@app.post("/account/session")
-def create_account_session(
-    req: AccountSessionCreateRequest,
-    _: str = Depends(verify_service_key),
+# ==================== AUTH ====================
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def login(req: LoginRequest) -> LoginResponse:
+    store = _store()
+    account_id = store.verify_login(req.user_name, req.password)
+    if account_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid credentials",
+        )
+    return LoginResponse(
+        access_token=create_access_token(account_id),
+        account_id=str(account_id),
+    )
+
+
+@app.post("/auth/logout")
+def logout(account_id: str = Depends(get_current_account)) -> dict[str, str]:
+    return {"status": "logged_out", "account_id": account_id}
+
+
+@app.get("/auth/me", response_model=AccountInfoResponse)
+def get_me(account_id: str = Depends(get_current_account)) -> AccountInfoResponse:
+    store = _store()
+    account = store.get_account(account_id)
+    return AccountInfoResponse(account_id=account_id, user_name=account["user_name"])
+
+
+# ==================== SESSIONS ====================
+
+
+@app.get("/sessions", response_model=SessionListResponse)
+def list_sessions(account_id: str = Depends(get_current_account)) -> SessionListResponse:
+    store = _store()
+    sessions = store.get_sessions(account_id)
+    return SessionListResponse(
+        sessions=[
+            SessionResponse(
+                id=s["id"],
+                thread_id=s["thread_id"],
+                label=s["label"],
+                created_at=s["created_at"],
+                last_used_at=s["last_used_at"],
+            )
+            for s in sessions
+        ]
+    )
+
+
+@app.post("/sessions", response_model=SessionResponse)
+def create_session(
+    req: SessionCreateRequest,
+    account_id: str = Depends(get_current_account),
+) -> SessionResponse:
+    store = _store()
+    thread_id = req.thread_id or uuid.uuid4().hex
+    store.create_session(account_id, thread_id, req.label or "")
+    session = store.get_session(thread_id)
+    if session is None:
+        raise HTTPException(status_code=500, detail="Failed to create session")
+    return SessionResponse(
+        id=session["id"],
+        thread_id=session["thread_id"],
+        label=session["label"],
+        created_at=session["created_at"],
+        last_used_at=session["last_used_at"],
+    )
+
+
+@app.delete("/sessions/{thread_id}")
+def delete_session(
+    thread_id: str,
+    account_id: str = Depends(get_current_account),
 ) -> dict[str, str]:
-    store = get_credential_store()
-    store.create_session(req.thread_id, req.user_name, req.password, req.access_key)
-    return {"thread_id": req.thread_id, "status": "created"}
+    store = _store()
+    session = store.get_session(thread_id)
+    if session is None or str(session["account_id"]) != account_id:
+        raise HTTPException(status_code=404, detail="Session not found")
+    store.delete_session(thread_id)
+    try:
+        conn = sqlite3.connect(settings.checkpoint_db_path, check_same_thread=False)
+        try:
+            SqliteSaver(conn).delete_thread(thread_id)
+        finally:
+            conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"thread_id": thread_id, "status": "ended"}
 
 
-@app.post("/session/end")
-def end_session(
-    req: SessionEndRequest,
-    _: str = Depends(verify_service_key),
-) -> dict[str, str]:
-    store = get_credential_store()
-    store.delete_session(req.thread_id)
-    return {"thread_id": req.thread_id, "status": "ended"}
+# ==================== CHAT ====================
+
+
+from langgraph.checkpoint.sqlite import SqliteSaver
+
+
+def _get_history(thread_id: str, db_path: str, store: EncryptedCredentialStore) -> list:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    saver = SqliteSaver(conn)
+    config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    try:
+        checkpoint = saver.get(config)
+    except Exception:  # noqa: BLE001
+        return []
+    if not (checkpoint and isinstance(checkpoint.get("channel_values"), dict)):
+        return []
+    raw = checkpoint["channel_values"].get("messages", [])
+    # Orphan detection must run on the full message list (ToolMessages included),
+    # otherwise every tool call looks orphaned and the thread gets wiped.
+    cleaned = _strip_orphaned_tool_calls(raw, saver, thread_id)
+    return [m for m in cleaned if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
+
+
+def _strip_orphaned_tool_calls(messages: list, saver: SqliteSaver, thread_id: str) -> list:
+    tool_call_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if tc_id:
+                    tool_call_ids.add(tc_id)
+    tool_result_ids: set[str] = set()
+    for msg in messages:
+        if isinstance(msg, ToolMessage):
+            tool_result_ids.add(msg.tool_call_id)
+    orphaned = tool_call_ids - tool_result_ids
+    if not orphaned:
+        return messages
+    drop_index = -1
+    for i, msg in enumerate(messages):
+        if isinstance(msg, AIMessage):
+            for tc in msg.tool_calls:
+                tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                if tc_id in orphaned:
+                    drop_index = i
+                    break
+        if drop_index != -1:
+            break
+    if drop_index == -1:
+        return messages
+    cleaned = messages[:drop_index]
+    # The checkpoint has orphaned tool_calls from a crashed execution.
+    # Delete the thread from the checkpointer so langgraph starts fresh
+    # with the cleaned history (the credential store session is preserved).
+    try:
+        saver.delete_thread(thread_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not delete corrupted thread_id=%s", thread_id)
+    return cleaned
+
+
+def _serialize_tool_calls(msg: AIMessage) -> list[dict]:
+    return [
+        {
+            "tool_call_id": tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", ""),
+            "name": tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", ""),
+            "args": tc.get("args") if isinstance(tc, dict) else getattr(tc, "args", {}),
+        }
+        for tc in getattr(msg, "tool_calls", [])
+    ]
+
+
+def _is_tool_echo(text: str) -> bool:
+    s = text.strip()
+    return (
+        s.startswith("{'status'")
+        or s.startswith('{"status"')
+        or s.startswith("Error: ")
+    )
+
+
+def _message_text(msg: Any) -> str:
+    content = getattr(msg, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict):
+                parts.append(str(block.get("text", "")))
+            else:
+                parts.append(str(block))
+        return "".join(parts)
+    return str(content or "")
+
+
+def _normalize_tool_result(text: str) -> str:
+    if not text or not (text.startswith("{") or text.startswith("[")):
+        return text
+    try:
+        parsed = ast.literal_eval(text)
+        return json.dumps(parsed, indent=2)
+    except Exception:
+        return text
+
+
+def _reasoning_delta_from_chunk(chunk: Any) -> str:
+    extra = getattr(chunk, "additional_kwargs", {}) or {}
+    if isinstance(extra, dict):
+        rc = extra.get("reasoning_content")
+        if isinstance(rc, str) and rc:
+            return rc
+    content = getattr(chunk, "content", "")
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "reasoning":
+                text = block.get("reasoning") or block.get("text") or ""
+                if isinstance(text, str):
+                    parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _collect_turn_events(messages: list) -> list[dict]:
+    events: list[dict] = []
+    tool_call_map: dict[str, str] = {}
+    for msg in messages:
+        if isinstance(msg, AIMessage):
+            extra = getattr(msg, "additional_kwargs", {}) or {}
+            reasoning = extra.get("reasoning_content") if isinstance(extra, dict) else None
+            if isinstance(reasoning, str) and reasoning.strip():
+                events.append({"type": "text", "text": reasoning.strip()})
+            text = _message_text(msg).strip()
+            if text and not _is_tool_echo(text):
+                events.append({"type": "text", "text": text})
+            for tc in _serialize_tool_calls(msg):
+                tool_call_map[tc["tool_call_id"]] = tc["name"]
+                events.append({"type": "tool_call", **tc})
+        elif isinstance(msg, ToolMessage):
+            tc_id = getattr(msg, "tool_call_id", "")
+            name = tool_call_map.get(tc_id, "")
+            result_event = {
+                "type": "tool_result",
+                "tool_call_id": tc_id,
+                "name": name,
+                "result": _normalize_tool_result(_message_text(msg)),
+            }
+            insert_idx = len(events)
+            for i in range(len(events) - 1, -1, -1):
+                if (
+                    events[i].get("type") == "tool_call"
+                    and events[i].get("tool_call_id") == tc_id
+                ):
+                    insert_idx = i + 1
+                    break
+            events.insert(insert_idx, result_event)
+    return events
+
+
+def _finalize_turn(events: list[dict]) -> dict[str, Any]:
+    final_idx = -1
+    for i, ev in enumerate(events):
+        if ev["type"] == "text":
+            final_idx = i
+    content = events[final_idx]["text"] if final_idx != -1 else ""
+    steps = [
+        {"type": "reasoning", "text": ev["text"]} if ev["type"] == "text" else ev
+        for i, ev in enumerate(events)
+        if i != final_idx
+    ]
+    return {"content": content, "steps": steps}
+
+
+def _get_display_history(
+    thread_id: str, db_path: str, store: EncryptedCredentialStore
+) -> list[dict]:
+    raw_messages = _get_history(thread_id, db_path, store)
+
+    merged: list[dict] = []
+    turn: list = []
+    for msg in raw_messages:
+        if isinstance(msg, HumanMessage):
+            turn_data = _finalize_turn(_collect_turn_events(turn))
+            if turn_data["content"] or turn_data["steps"]:
+                merged.append({"role": "assistant", **turn_data})
+            merged.append({"role": "user", "content": getattr(msg, "content", "") or ""})
+            turn = []
+        else:
+            turn.append(msg)
+    turn_data = _finalize_turn(_collect_turn_events(turn))
+    if turn_data["content"] or turn_data["steps"]:
+        merged.append({"role": "assistant", **turn_data})
+    return merged
 
 
 @app.post("/chat", response_model=ChatResponse)
 def chat(
     req: ChatRequest,
-    _: str = Depends(verify_service_key),
+    account_id: str = Depends(get_current_account),
 ) -> ChatResponse:
-    store = get_credential_store()
-    try:
-        store.get_or_create_client(req.thread_id)
-    except SessionNotFoundError:
+    store = _store()
+    session = store.get_session(req.thread_id)
+    if session is None or str(session["account_id"]) != account_id:
         raise HTTPException(
             status_code=404,
             detail=f"No active session for thread_id: {req.thread_id}",
         )
+    store.get_or_create_client(req.thread_id)
 
+    history = _get_history(req.thread_id, settings.checkpoint_db_path, store)
     graph = build_graph(settings.checkpoint_db_path)
-
-    config = {
-        "thread_id": req.thread_id,
-        "metadata": {"thread_id": req.thread_id},
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": req.thread_id, "account_id": account_id},
+        "metadata": {"account_id": account_id, "thread_id": req.thread_id},
         "recursion_limit": settings.max_tool_calls + 2,
     }
-
     try:
         result = graph.invoke(
-            {"messages": [HumanMessage(content=req.message)]},
+            {"messages": history + [HumanMessage(content=req.message)]},
             config=config,
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for thread_id=%s", req.thread_id)
         raise HTTPException(status_code=500, detail="Agent execution failed") from exc
 
     last_message = result["messages"][-1]
-    response_text = getattr(last_message, "content", str(last_message))
-    return ChatResponse(response=response_text)
+    input_length = len(history) + 1
+    turn_data = _finalize_turn(_collect_turn_events(result["messages"][input_length:]))
+    if not turn_data["content"]:
+        turn_data["content"] = str(getattr(last_message, "content", "") or "")
+    store._touch_session(req.thread_id)
+    return ChatResponse(response=turn_data["content"], steps=turn_data["steps"])
+
+
+@app.post("/chat/stream")
+def chat_stream(
+    req: ChatRequest,
+    account_id: str = Depends(get_current_account),
+) -> StreamingResponse:
+    store = _store()
+    session = store.get_session(req.thread_id)
+    if session is None or str(session["account_id"]) != account_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active session for thread_id: {req.thread_id}",
+        )
+    store.get_or_create_client(req.thread_id)
+    history = _get_history(req.thread_id, settings.checkpoint_db_path, store)
+    graph = build_graph(settings.checkpoint_db_path)
+    config: dict[str, Any] = {
+        "configurable": {"thread_id": req.thread_id, "account_id": account_id},
+        "metadata": {"account_id": account_id, "thread_id": req.thread_id},
+        "recursion_limit": settings.max_tool_calls + 2,
+    }
+
+    def _sse(event: dict[str, Any]) -> str:
+        return f"data: {json.dumps(event)}\n\n"
+
+    def generate() -> Generator[str, None, None]:
+        turn_events: list[dict] = []
+        tool_call_map: dict[str, str] = {}
+        collected_ais: list[AIMessage] = []
+        start_time = __import__("time").monotonic()
+        total_output_tokens = 0
+        try:
+            yield _sse({"type": "start"})
+            for mode, payload in graph.stream(
+                {"messages": history + [HumanMessage(content=req.message)]},
+                config=config,
+                stream_mode=["messages", "updates"],
+            ):
+                if mode == "messages":
+                    chunk, meta = payload
+                    if not isinstance(chunk, AIMessageChunk):
+                        continue
+                    if not isinstance(meta, dict) or meta.get("langgraph_node") != "agent":
+                        continue
+                    usage = getattr(chunk, "usage_metadata", None)
+                    if isinstance(usage, dict):
+                        output_tokens = usage.get("output_tokens")
+                        if isinstance(output_tokens, int) and output_tokens > 0:
+                            total_output_tokens = output_tokens
+                    reasoning_delta = _reasoning_delta_from_chunk(chunk)
+                    if reasoning_delta:
+                        yield _sse({"type": "reasoning_delta", "text": reasoning_delta})
+                        turn_events.append({"type": "text", "text": reasoning_delta})
+                    text_delta = _message_text(chunk)
+                    if text_delta:
+                        yield _sse({"type": "text_delta", "text": text_delta})
+                        turn_events.append({"type": "text", "text": text_delta})
+                elif mode == "updates":
+                    if not isinstance(payload, dict):
+                        continue
+                    update = payload.get("agent")
+                    if isinstance(update, dict):
+                        for m in update.get("messages", []):
+                            if not isinstance(m, AIMessage):
+                                continue
+                            collected_ais.append(m)
+                            if not m.tool_calls:
+                                continue
+                            text = _message_text(m).strip()
+                            if text and not _is_tool_echo(text):
+                                yield _sse({"type": "reasoning", "text": text})
+                                turn_events.append({"type": "text", "text": text})
+                            for tc in _serialize_tool_calls(m):
+                                tool_call_map[tc["tool_call_id"]] = tc["name"]
+                                turn_events.append({"type": "tool_call", **tc})
+                                yield _sse({"type": "tool_call", **tc})
+                    update = payload.get("tools")
+                    if isinstance(update, dict):
+                        for m in update.get("messages", []):
+                            if not isinstance(m, ToolMessage):
+                                continue
+                            collected_ais.append(m)
+                            tc_id = getattr(m, "tool_call_id", "")
+                            name = tool_call_map.get(tc_id, "")
+                            result = _normalize_tool_result(_message_text(m))
+                            result_event = {
+                                "type": "tool_result",
+                                "tool_call_id": tc_id,
+                                "name": name,
+                                "result": result,
+                            }
+                            insert_idx = len(turn_events)
+                            for i in range(len(turn_events) - 1, -1, -1):
+                                if (
+                                    turn_events[i].get("type") == "tool_call"
+                                    and turn_events[i].get("tool_call_id") == tc_id
+                                ):
+                                    insert_idx = i + 1
+                                    break
+                            turn_events.insert(insert_idx, result_event)
+                            yield _sse(result_event)
+            turn_data = _finalize_turn(_collect_turn_events(collected_ais))
+            if not turn_data["content"] and collected_ais:
+                turn_data["content"] = _message_text(collected_ais[-1]).strip()
+            store._touch_session(req.thread_id)
+            elapsed = max(__import__("time").monotonic() - start_time, 0.001)
+            tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None
+            yield _sse(
+                {
+                    "type": "done",
+                    "response": turn_data["content"],
+                    "steps": turn_data["steps"],
+                    "tokens": total_output_tokens or None,
+                    "tps": tps,
+                }
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Streaming chat failed for thread_id=%s", req.thread_id)
+            yield _sse({"type": "error", "detail": "Agent execution failed"})
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/chat/history/{thread_id}")
+def chat_history(
+    thread_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    store = _store()
+    session = store.get_session(thread_id)
+    if session is None or str(session["account_id"]) != account_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No active session for thread_id: {thread_id}",
+        )
+
+    try:
+        messages = _get_display_history(thread_id, settings.checkpoint_db_path, store)
+        return {"messages": messages}
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to load chat history for thread_id=%s", thread_id)
+        raise HTTPException(status_code=500, detail="Failed to load chat history") from exc
+
+
+# ==================== DASHBOARD API ====================
+
+
+@app.get("/api/profile")
+def api_profile(account_id: str = Depends(get_current_account)) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "get_profile")
+
+
+@app.get("/api/warehouses")
+def api_warehouses(
+    page: str = "1",
+    per_page: str = "20",
+    segment_type: str = "hyperlocal",
+    status: str | None = None,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    params = WarehouseListRequest(
+        page=page,
+        perPage=per_page,
+        segment_type=segment_type,
+        status=status,
+    )
+    with _account_client(account_id) as client:
+        return _call(client, "get_warehouse_list", params)
+
+
+@app.post("/api/warehouses")
+def api_create_warehouse(
+    payload: SaveWarehouseRequest,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "save_warehouse", payload)
+
+
+@app.put("/api/warehouses/{warehouse_id}")
+def api_update_warehouse(
+    warehouse_id: str,
+    payload: dict[str, Any],
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    model = UpdateWarehouseRequest(**{"warehouseId": warehouse_id, **payload})
+    with _account_client(account_id) as client:
+        return _call(client, "update_warehouse", model)
+
+
+@app.get("/api/orders")
+def api_orders(
+    page: str = "1",
+    per_page: str = "20",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    status: str | None = None,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    raise HTTPException(
+        status_code=501,
+        detail="Order listing is not supported by the Bigship SDK",
+    )
+
+
+@app.get("/api/orders/{order_id}")
+def api_order_detail(
+    order_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "get_order_detail", order_id)
+
+
+@app.post("/api/orders/{order_id}/cancel")
+def api_cancel_order(
+    order_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "cancel_order", order_id)
+
+
+@app.get("/api/orders/{order_id}/track")
+def api_track_order(
+    order_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "track_order", order_id)
+
+
+@app.get("/api/orders/{order_id}/documents")
+def api_list_documents(
+    order_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    return {"order_id": order_id, "document_types": DOCUMENT_TYPES}
+
+
+@app.get("/api/orders/{order_id}/documents/{doc_type}")
+def api_download_document(
+    order_id: str,
+    doc_type: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    if doc_type not in DOCUMENT_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"document_type must be one of {DOCUMENT_TYPES}",
+        )
+    with _account_client(account_id) as client:
+        return _call(client, "download_document", order_id, doc_type)
+
+
+@app.get("/api/rate-calculator/payment-modes")
+def api_payment_modes(
+    segment_type: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "get_payment_modes", segment_type)
+
+
+@app.get("/api/rate-calculator/package-types")
+def api_package_types(
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "get_package_types")
+
+
+@app.post("/api/rate-calculator/calculate")
+def api_calculate_rate(
+    payload: RateCalculatorRequest,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "calculate_rate", payload)
+
+
+@app.get("/api/serviceable-couriers/{order_id}")
+def api_serviceable_couriers(
+    order_id: str,
+    account_id: str = Depends(get_current_account),
+) -> dict[str, Any]:
+    with _account_client(account_id) as client:
+        return _call(client, "get_serviceable_couriers", order_id)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+_frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+
+
+@app.exception_handler(404)
+def not_found(request: Request, exc: Exception):
+    if _frontend_dist.is_dir() and request.method == "GET":
+        return FileResponse(str(_frontend_dist / "index.html"))
+    return JSONResponse(status_code=404, content={"detail": "Not found"})
+
+
+if _frontend_dist.is_dir():
+    app.mount(
+        "/",
+        StaticFiles(directory=str(_frontend_dist), html=True),
+        name="static",
+    )
