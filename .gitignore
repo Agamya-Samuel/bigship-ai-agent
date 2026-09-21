@@ -46,3 +46,4 @@ checkpoints.db
 # IDE
 .commandcode/
 .kilo/
+checkpoints.*
