@@ -25,6 +25,18 @@ function normalizeRole(role: string): 'user' | 'assistant' {
 
 type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number; model?: string }
 
+function normalizeChatMessage(raw: Partial<ChatMessage> & { role: string }): ChatMessage {
+  return {
+    role: normalizeRole(raw.role),
+    content: raw.content ?? '',
+    steps: raw.steps,
+    tokens: raw.tokens,
+    tps: raw.tps,
+    timestamp: raw.timestamp,
+    model: raw.model,
+  }
+}
+
 function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
   const [open, setOpen] = useState(false)
   useEffect(() => {
@@ -292,11 +304,7 @@ export default function ChatPage() {
         const data = await getChatHistory(activeThreadId)
         if (!cancelled) {
           setMessages(
-            (data.messages || []).map((m: { role: string; content: string; steps?: AgentStep[] }) => ({
-              role: normalizeRole(m.role),
-              content: m.content,
-              steps: m.steps,
-            }))
+            (data.messages || []).map((m: ChatMessage) => normalizeChatMessage(m))
           )
         }
       } catch {
@@ -463,7 +471,7 @@ export default function ChatPage() {
             return next
           }
           if (ev.type === 'done') {
-            return [...prev.slice(0, idx), { role: 'assistant', content: ev.response, steps: ev.steps ?? [], tokens: ev.tokens, tps: ev.tps, timestamp: Date.now(), model: ev.model }]
+            return [...prev.slice(0, idx), normalizeChatMessage({ role: 'assistant', content: ev.response, steps: ev.steps ?? [], tokens: ev.tokens, tps: ev.tps, timestamp: Date.now(), model: ev.model })]
           }
           if (ev.type === 'error') {
             const next = [...prev]
