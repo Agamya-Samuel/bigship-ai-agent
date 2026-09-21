@@ -13,21 +13,40 @@ from bigship_sdk.models import (
     UpdateWarehouseRequest,
     WarehouseListRequest,
 )
-from langchain_core.tools import InjectedToolArg, tool
+from langchain_core.tools import tool
+from langgraph.prebuilt.tool_node import ToolRuntime
 from pydantic import BaseModel, Field
 
 from agent.credentials import get_credential_store
 
 
 def _format_result(response: Any) -> str:
-    if response.status is True and response.data is not None:
-        if hasattr(response.data, "model_dump"):
-            return str(response.data.model_dump(mode="json", exclude_none=True))
-        return str(response.data)
-    return f"Error: {response.message}"
+    data: Any = getattr(response, "data", None)
+    message: Any = getattr(response, "message", None)
+    if data is not None and hasattr(data, "model_dump"):
+        data = data.model_dump(mode="json", exclude_none=True)
+    if not getattr(response, "status", True):
+        return f"Error: {message}"
+    if isinstance(data, list):
+        return _format_list(data)
+    return str(data)
 
 
-def _get_client(thread_id: str) -> BigshipClient:
+def _format_list(items: list[dict]) -> str:
+    if not items:
+        return "No results."
+    keys = list(items[0].keys())
+    header = "| " + " | ".join(keys) + " |"
+    separator = "|" + "|".join(["---"] * len(keys)) + "|"
+    rows = []
+    for item in items:
+        row = "| " + " | ".join(str(item.get(k, "")) for k in keys) + " |"
+        rows.append(row)
+    return "\n".join([header, separator] + rows)
+
+
+def _get_client(runtime: ToolRuntime) -> BigshipClient:
+    thread_id = runtime.config.get("configurable", {}).get("thread_id", "")
     return get_credential_store().get_or_create_client(thread_id)
 
 
@@ -115,10 +134,10 @@ CreateOrderInput = Annotated[
 
 @tool
 def get_profile(
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get the merchant's profile information including wallet balance."""
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_profile()
     return _format_result(response)
 
@@ -129,7 +148,7 @@ def get_profile(
 @tool
 def save_warehouse(
     payload: SaveWarehouseRequest,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Save a new warehouse.
 
@@ -144,7 +163,7 @@ def save_warehouse(
     - warehouseAddressLandMark: landmark (3-50 chars)
     - warehouseCountry: default "India"
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.save_warehouse(payload)
     return _format_result(response)
 
@@ -152,7 +171,7 @@ def save_warehouse(
 @tool
 def get_warehouse_list(
     params: WarehouseListRequest,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get the list of warehouses.
 
@@ -162,7 +181,7 @@ def get_warehouse_list(
     - segment_type: "hyperlocal" or "local"
     - status: optional filter (e.g., "active")
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_warehouse_list(params)
     return _format_result(response)
 
@@ -170,7 +189,7 @@ def get_warehouse_list(
 @tool
 def update_warehouse(
     payload: UpdateWarehouseRequest,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Update an existing warehouse.
 
@@ -186,7 +205,7 @@ def update_warehouse(
     - warehouseAddressLandMark: landmark (3-50 chars)
     - warehouseCountry: default "India"
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.update_warehouse(payload)
     return _format_result(response)
 
@@ -196,10 +215,10 @@ def update_warehouse(
 
 @tool
 def get_package_types(
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get the list of available package types for hyperlocal shipments."""
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_package_types()
     return _format_result(response)
 
@@ -207,23 +226,23 @@ def get_package_types(
 @tool
 def get_payment_modes(
     segment_type: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get available payment modes for a given segment type.
 
     segment_type examples: "hyperlocal", "domestic_b2b", "domestic_b2c"
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_payment_modes(segment_type)
     return _format_result(response)
 
 
 @tool
 def get_risk_types(
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get the list of available risk types for domestic shipments."""
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_risk_types()
     return _format_result(response)
 
@@ -234,7 +253,7 @@ def get_risk_types(
 @tool
 def calculate_rate(
     payload: RateCalculatorRequest,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Calculate shipping rates for a shipment.
 
@@ -248,7 +267,9 @@ def calculate_rate(
     - codAmount: optional COD amount
     - boxes: list of boxes with box_length, box_width, box_height, box_dead_weight, no_of_box
     """
-    client = _get_client(thread_id)
+    if payload.codAmount is None and payload.paymentModeId == 2:
+        payload.codAmount = str(payload.invoiceValue)
+    client = _get_client(runtime)
     response = client.calculate_rate(payload)
     return _format_result(response)
 
@@ -259,7 +280,7 @@ def calculate_rate(
 @tool
 def create_order(
     payload: CreateOrderInput,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Create a new shipment order.
 
@@ -309,7 +330,7 @@ def create_order(
 
     domestic_b2c: same as domestic_b2b without MasterOrderCollectableAmount and ProductName
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     raw = payload.model_dump(mode="json", exclude_none=True)
     segment_type = raw.get("segment_type")
     model: Any
@@ -328,13 +349,13 @@ def create_order(
 @tool
 def get_serviceable_couriers(
     order_id: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get the list of serviceable couriers for a given order.
 
     order_id: the CustomGlobalOrderId or MasterCustomOrderId of the order
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_serviceable_couriers(order_id)
     return _format_result(response)
 
@@ -342,7 +363,7 @@ def get_serviceable_couriers(
 @tool
 def place_order(
     payload: PlaceOrderRequest,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Place/confirm an order with a selected courier.
 
@@ -352,7 +373,7 @@ def place_order(
     - invoiceType: optional invoice type
     - riskTypeId: optional risk type ID
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.place_order(payload)
     return _format_result(response)
 
@@ -360,13 +381,13 @@ def place_order(
 @tool
 def cancel_order(
     order_id: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Cancel an order by its ID.
 
     order_id: the CustomGlobalOrderId of the order to cancel
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.cancel_order(order_id)
     return _format_result(response)
 
@@ -377,13 +398,13 @@ def cancel_order(
 @tool
 def track_order(
     order_id: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Track the current status and history of an order.
 
     order_id: the CustomGlobalOrderId of the order to track
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.track_order(order_id)
     return _format_result(response)
 
@@ -391,13 +412,13 @@ def track_order(
 @tool
 def get_order_detail(
     order_id: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Get detailed information about an order.
 
     order_id: the MasterCustomOrderId of the order
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.get_order_detail(order_id)
     return _format_result(response)
 
@@ -406,14 +427,14 @@ def get_order_detail(
 def download_document(
     order_id: str,
     document_type: str,
-    thread_id: Annotated[str, InjectedToolArg] = "",
+    runtime: ToolRuntime,
 ) -> str:
     """Download a shipment document (invoice, label, ewaybill, manifest).
 
     order_id: the CustomGlobalOrderId of the order
     document_type: one of "invoice", "label", "ewaybill", "manifest"
     """
-    client = _get_client(thread_id)
+    client = _get_client(runtime)
     response = client.download_document(order_id, document_type)
     return _format_result(response)
 
