@@ -25,6 +25,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.types import RunnableConfig
 from pydantic import BaseModel
 
 from agent.auth import create_access_token, get_current_account
@@ -257,16 +259,84 @@ def delete_session(
 # ==================== CHAT ====================
 
 
-from langgraph.checkpoint.sqlite import SqliteSaver
+def _get_message_timestamp(msg: Any) -> str | int | float | None:
+    timestamp = getattr(msg, "timestamp", None)
+    if isinstance(timestamp, (int, float, str)):
+        return timestamp
+    metadata = getattr(msg, "response_metadata", None)
+    if isinstance(metadata, dict):
+        timestamp = metadata.get("timestamp")
+        if isinstance(timestamp, (int, float, str)):
+            return timestamp
+    return None
 
 
-def _get_history(thread_id: str, db_path: str, store: EncryptedCredentialStore) -> list:
+def _set_message_timestamp(msg: Any, timestamp: str) -> None:
+    if _get_message_timestamp(msg) is not None:
+        return
+    metadata = getattr(msg, "response_metadata", None)
+    if isinstance(metadata, dict):
+        metadata["timestamp"] = timestamp
+    else:
+        setattr(msg, "timestamp", timestamp)
+
+
+def _message_timestamp_key(msg: Any, occurrence: int) -> tuple[str, str, int]:
+    message_id = getattr(msg, "id", None)
+    identity = str(message_id) if message_id else _message_text(msg)
+    return type(msg).__name__, identity, occurrence
+
+
+def _attach_checkpoint_timestamps(
+    messages: list[Any],
+    saver: SqliteSaver,
+    thread_id: str,
+) -> None:
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+    try:
+        checkpoints = list(saver.list(config))
+    except Exception:  # noqa: BLE001
+        return
+    checkpoints.sort(key=lambda item: str(item.checkpoint.get("ts", "")))
+    timestamps: dict[tuple[str, str, int], str] = {}
+    for checkpoint_tuple in checkpoints:
+        checkpoint_messages = checkpoint_tuple.checkpoint.get("channel_values", {}).get(
+            "messages", []
+        )
+        occurrences: dict[tuple[str, str], int] = {}
+        for message in checkpoint_messages:
+            base_key = (
+                type(message).__name__,
+                str(getattr(message, "id", None)) or _message_text(message),
+            )
+            occurrence = occurrences.get(base_key, 0)
+            occurrences[base_key] = occurrence + 1
+            key = _message_timestamp_key(message, occurrence)
+            checkpoint_ts = checkpoint_tuple.checkpoint.get("ts")
+            if checkpoint_ts:
+                timestamps.setdefault(key, str(checkpoint_ts))
+    latest_occurrences: dict[tuple[str, str], int] = {}
+    for message in messages:
+        base_key = (
+            type(message).__name__,
+            str(getattr(message, "id", None)) or _message_text(message),
+        )
+        occurrence = latest_occurrences.get(base_key, 0)
+        latest_occurrences[base_key] = occurrence + 1
+        timestamp = timestamps.get(_message_timestamp_key(message, occurrence))
+        if timestamp:
+            _set_message_timestamp(message, timestamp)
+
+
+def _get_history(thread_id: str, db_path: str, store: EncryptedCredentialStore) -> list[Any]:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     try:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         saver = SqliteSaver(conn)
-        config = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        config: RunnableConfig = {
+            "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+        }
         try:
             checkpoint = saver.get(config)
         except Exception:  # noqa: BLE001
@@ -280,6 +350,24 @@ def _get_history(thread_id: str, db_path: str, store: EncryptedCredentialStore) 
         return [m for m in cleaned if isinstance(m, (AIMessage, HumanMessage, ToolMessage))]
     finally:
         conn.close()
+
+
+def _get_history_with_timestamps(
+    thread_id: str,
+    db_path: str,
+    store: EncryptedCredentialStore,
+) -> list[Any]:
+    messages = _get_history(thread_id, db_path, store)
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _attach_checkpoint_timestamps(messages, SqliteSaver(conn), thread_id)
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        conn.close()
+    return messages
 
 
 def _strip_orphaned_tool_calls(messages: list, saver: SqliteSaver, thread_id: str) -> list:
@@ -420,8 +508,8 @@ def _get_turn_metadata(messages: list) -> dict[str, Any]:
                 tokens = usage.get("output_tokens") or usage.get("total_tokens")
                 if isinstance(tokens, int) and tokens > 0:
                     result["tokens"] = tokens
-    ts = getattr(last_ai, "timestamp", None)
-    if isinstance(ts, (int, float)):
+    ts = _get_message_timestamp(last_ai)
+    if ts is not None:
         result["timestamp"] = ts
     return result
 
@@ -573,7 +661,7 @@ def _finalize_turn(events: list[dict]) -> dict[str, Any]:
 def _get_display_history(
     thread_id: str, db_path: str, store: EncryptedCredentialStore
 ) -> list[dict]:
-    raw_messages = _get_history(thread_id, db_path, store)
+    raw_messages = _get_history_with_timestamps(thread_id, db_path, store)
     session_model = None
     session_metrics: dict[str, Any] = {}
     try:
@@ -603,7 +691,11 @@ def _get_display_history(
                     "tps": metadata.get("tps"),
                     "timestamp": metadata.get("timestamp"),
                 })
-            merged.append({"role": "user", "content": getattr(msg, "content", "") or ""})
+            user_timestamp = _get_message_timestamp(msg)
+            user_message = {"role": "user", "content": getattr(msg, "content", "") or ""}
+            if user_timestamp is not None:
+                user_message["timestamp"] = user_timestamp
+            merged.append(user_message)
             turn = []
         else:
             turn.append(msg)

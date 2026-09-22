@@ -124,6 +124,24 @@ def test_multiple_turns_do_not_leak_steps() -> None:
     assert out[3]["steps"] == []
 
 
+def test_display_history_preserves_user_and_assistant_timestamps() -> None:
+    user_timestamp = "2026-09-22T10:15:00+00:00"
+    assistant_timestamp = "2026-09-22T10:15:03+00:00"
+    raw = [
+        HumanMessage(
+            content="hello",
+            response_metadata={"timestamp": user_timestamp},
+        ),
+        AIMessage(
+            content="Hi",
+            response_metadata={"timestamp": assistant_timestamp},
+        ),
+    ]
+    out = _run(raw)
+    assert out[0]["timestamp"] == user_timestamp
+    assert out[1]["timestamp"] == assistant_timestamp
+
+
 def test_intermediate_reasoning_only_turn() -> None:
     raw = [
         HumanMessage(content="plan something"),
