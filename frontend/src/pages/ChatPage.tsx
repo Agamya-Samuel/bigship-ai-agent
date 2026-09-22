@@ -292,7 +292,7 @@ function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
               onClick={() => onPick(s.prompt)}
               className="group flex items-start gap-3 p-3.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-subtle)] hover:border-[var(--border-default)] transition-all hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-base)]"
             >
-              <Icon className="h-4 w-4 mt-0.5 text-[var(--text-tertiary)] group-hover:text-[var(--accent)] transition-colors" />
+              <Icon className="h-4 w-4 mt-0.5 shrink-0 text-[var(--text-tertiary)] group-hover:text-[var(--accent)] transition-colors" />
               <div>
                 <div className="text-sm font-medium text-[var(--text-primary)]">{s.title}</div>
                 <div className="text-xs text-[var(--text-tertiary)] mt-0.5 line-clamp-2">{s.prompt}</div>
