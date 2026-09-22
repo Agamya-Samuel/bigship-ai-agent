@@ -40,10 +40,10 @@ function normalizeChatMessage(raw: Partial<ChatMessage> & { role: string }): Cha
 function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
   const [open, setOpen] = useState(false)
   useEffect(() => {
-    if (isLatest && live) {
+    if (isLatest) {
       setOpen(true)
     }
-  }, [isLatest, live])
+  }, [isLatest])
   return (
     <div className="text-xs text-(--text-tertiary)">
       <button
@@ -82,17 +82,17 @@ function StepTrace({ steps, live }: { steps?: AgentStep[]; live?: boolean }) {
       {steps.map((s, i) => {
         const nextStep = steps[i + 1]
         const isLastReasoningBeforeTools = s.type === 'reasoning' && i === lastReasoningIdx && nextStep?.type === 'tool_call'
-        const showPuttingTogether = isLastReasoningBeforeTools && live
+        const showPuttingTogether = isLastReasoningBeforeTools
         return (
           <>
             {s.type === 'reasoning' && <ReasoningChip key={`reasoning-${i}`} text={s.text} live={live && i === lastReasoningIdx} isLatest={i === lastReasoningIdx} />}
             {showPuttingTogether && (
               <div key={`putting-${i}`} className="flex items-start gap-1.5 text-xs text-(--text-tertiary)">
                 <Cloud className="w-3 h-3 shrink-0 mt-0.5" />
-                <span className="italic">Putting it all together<span className="thinking-dots"></span></span>
+                <span className="italic">Putting it all together{live && <span className="thinking-dots"></span>}</span>
               </div>
             )}
-            {s.type === 'tool_call' && <ToolCallItem key={`tool-${i}`} step={s} processing={!toolResultIds.has((s as { tool_call_id?: string }).tool_call_id)} />}
+            {s.type === 'tool_call' && <ToolCallItem key={`tool-${i}`} step={s} processing={live && !toolResultIds.has((s as { tool_call_id?: string }).tool_call_id)} />}
             {s.type === 'tool_result' && <ToolResultItem key={`result-${i}`} step={s} />}
           </>
         )
