@@ -31,7 +31,8 @@ export default function Login() {
       const data = await login({ user_name: userName, password, access_key: accessKey })
       localStorage.setItem('access_token', data.access_token)
       localStorage.setItem('account_id', data.account_id)
-      window.location.href = '/'
+      localStorage.setItem('user_name', userName)
+      window.location.href = '/chat'
     } catch (err: unknown) {
       if (!err || typeof err !== 'object' || !('response' in err)) {
         setError('Server unavailable. Please try again later.')

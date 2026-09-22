@@ -39,6 +39,34 @@ function isPending(id: string | null): boolean {
   return id.startsWith(PENDING_PREFIX) || id === 'new'
 }
 
+function getSessionSortValue(session: Session): number {
+  if (isPending(session.thread_id) || !session.last_used_at || !session.created_at) {
+    return Number.POSITIVE_INFINITY
+  }
+
+  const lastUsed = Date.parse(session.last_used_at)
+  if (Number.isFinite(lastUsed)) return lastUsed
+
+  const created = Date.parse(session.created_at)
+  return Number.isFinite(created) ? created : 0
+}
+
+function sortSessions(sessions: Session[]): Session[] {
+  return [...sessions].sort((a, b) => getSessionSortValue(b) - getSessionSortValue(a))
+}
+
+function formatSessionTimestamp(session: Session): string {
+  const value = getTimestampValue(session.last_used_at || session.created_at)
+  if (value === null) return 'Just now'
+
+  return new Intl.DateTimeFormat(undefined, {
+    month: 'short',
+    day: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+  }).format(new Date(value))
+}
+
 function normalizeRole(role: string): 'user' | 'assistant' {
   if (role === 'assistant' || role === 'ai') return 'assistant'
   return 'user'
@@ -378,6 +406,8 @@ function SidebarContent({
   userName: string
   handleLogout: () => void
 }) {
+  const orderedSessions = sortSessions(sessions)
+
   return (
     <div className="flex flex-col h-full">
       <div className="px-3 pt-3 pb-2 flex items-center justify-between">
@@ -407,26 +437,35 @@ function SidebarContent({
               No conversations yet
             </p>
           )}
-          {sessions.map((session) => {
+          {orderedSessions.map((session) => {
             const active = activeThreadId === session.thread_id
+            const timestampValue = getTimestampValue(session.last_used_at || session.created_at)
             return (
               <div
                 key={session.thread_id}
-                className={`group flex items-center gap-1 pl-2 pr-1 py-1.5 text-sm rounded-lg cursor-pointer transition-colors ${
+                className={`group flex items-start gap-1.5 pl-2 pr-1 py-2 text-sm rounded-lg cursor-pointer transition-colors ${
                   active
-                    ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]'
+                    ? 'bg-[var(--accent)] text-white'
                     : 'text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)]'
                 }`}
                 onClick={() => handleSessionClick(session.thread_id)}
               >
-                <MessageSquare className="h-3.5 w-3.5 shrink-0 opacity-60" />
-                <span className="truncate flex-1 text-[13px]">{session.label || 'Chat'}</span>
+                <MessageSquare className={`h-4.75 w-3.5 shrink-0 ${active ? 'text-white/80' : 'opacity-60'}`} />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] font-medium">{session.label || 'Chat'}</div>
+                  <time
+                    dateTime={timestampValue ? new Date(timestampValue).toISOString() : undefined}
+                    className={`mt-0.5 block text-[10px] leading-tight ${active ? 'text-white/65' : 'text-[var(--text-tertiary)]'}`}
+                  >
+                    {formatSessionTimestamp(session)}
+                  </time>
+                </div>
                 <button
                   onClick={(e) => {
                     e.stopPropagation()
                     handleDeleteSession(session.thread_id)
                   }}
-                  className="opacity-0 group-hover:opacity-100 text-[var(--text-tertiary)] hover:text-[var(--danger)] transition-all p-1 rounded"
+                  className={`opacity-0 group-hover:opacity-100 transition-all p-1 rounded ${active ? 'text-white/65 hover:text-white' : 'text-[var(--text-tertiary)] hover:text-[var(--danger)]'}`}
                   title="Delete chat"
                   aria-label="Delete chat"
                 >
@@ -913,8 +952,8 @@ export default function ChatPage() {
 
         {/* Floating composer */}
         <div
-          className="absolute bottom-0 left-0 right-0 md:left-64"
-          style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}
+          className="absolute bottom-0 left-0 right-0"
+          style={{ left: sidebarOpen ? '16rem' : '0', paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}
         >
           <div className="max-w-3xl mx-auto px-3 sm:px-6">
               {!activeThreadId ? (
@@ -932,7 +971,7 @@ export default function ChatPage() {
                     }}
                     onKeyDown={handleKeyDown}
                     placeholder="Message Bigship Agent…"
-                    rows={1}
+                    rows={3}
                     className="flex-1 resize-none bg-transparent text-base sm:text-[0.9375rem] text-[var(--text-primary)] placeholder:text-[var(--text-quaternary)] focus:outline-none px-1 py-2 max-h-48 leading-relaxed"
                     disabled={loading}
                   />
