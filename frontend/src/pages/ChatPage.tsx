@@ -475,7 +475,11 @@ export default function ChatPage() {
           }
           if (ev.type === 'error') {
             const next = [...prev]
-            next[idx] = { ...last, content: last.content || 'Error: failed to send message' }
+            const rateLimitMessage =
+              ev.error_type === 'rate_limited'
+                ? `Rate limit reached. Please try again${ev.retry_after ? ` in ~${ev.retry_after}s` : ' in a few seconds'}.`
+                : null
+            next[idx] = { ...last, content: last.content || rateLimitMessage || 'Error: failed to send message' }
             return next
           }
           return prev

@@ -51,4 +51,4 @@ export type StreamEvent =
   | { type: 'tool_call'; name: string; args: Record<string, unknown>; tool_call_id?: string }
   | { type: 'tool_result'; tool_call_id: string; name: string; result: string }
   | { type: 'done'; response: string; steps: AgentStep[]; tokens?: number; tps?: number; model?: string }
-  | { type: 'error'; detail?: string }
+  | { type: 'error'; detail?: string; error_type?: 'rate_limited'; retry_after?: number | null }
