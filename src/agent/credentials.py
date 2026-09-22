@@ -55,7 +55,10 @@ class EncryptedCredentialStore:
                 label TEXT DEFAULT '',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
-                model TEXT
+                model TEXT,
+                last_tokens INTEGER,
+                last_tps REAL,
+                last_timestamp TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_account_id
@@ -64,11 +67,24 @@ class EncryptedCredentialStore:
                 ON sessions(thread_id);
             """
         )
-        try:
-            self._conn.execute("ALTER TABLE sessions ADD COLUMN model TEXT")
-            self._conn.commit()
-        except Exception:  # noqa: BLE001
-            pass
+        self._conn.commit()
+        self._migrate_sessions_schema()
+
+    def _migrate_sessions_schema(self) -> None:
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        migrations = [
+            ("model", "TEXT"),
+            ("last_tokens", "INTEGER"),
+            ("last_tps", "REAL"),
+            ("last_timestamp", "TEXT"),
+        ]
+        for column, column_type in migrations:
+            if column not in columns:
+                try:
+                    self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {column_type}")
+                except Exception:  # noqa: BLE001
+                    pass
+        self._conn.commit()
 
     def _encrypt(self, plaintext: str) -> str:
         return self._fernet.encrypt(plaintext.encode()).decode()
@@ -155,7 +171,7 @@ class EncryptedCredentialStore:
     def get_sessions(self, account_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
-                "SELECT id, thread_id, label, created_at, last_used_at, model "
+                "SELECT id, thread_id, label, created_at, last_used_at, model, last_tokens, last_tps, last_timestamp "
                 "FROM sessions WHERE account_id = ? ORDER BY last_used_at DESC",
                 (account_id,),
             ).fetchall()
@@ -165,7 +181,7 @@ class EncryptedCredentialStore:
         with self._lock:
             row = self._conn.execute(
                 "SELECT id, account_id, thread_id, label, created_at, "
-                "last_used_at, model FROM sessions WHERE thread_id = ?",
+                "last_used_at, model, last_tokens, last_tps, last_timestamp FROM sessions WHERE thread_id = ?",
                 (thread_id,),
             ).fetchone()
         return dict(row) if row else None
@@ -251,6 +267,21 @@ class EncryptedCredentialStore:
             self._conn.execute(
                 "UPDATE sessions SET model = ? WHERE thread_id = ?",
                 (model, thread_id),
+            )
+            self._conn.commit()
+
+    def update_session_metrics(
+        self,
+        thread_id: str,
+        *,
+        tokens: int | None = None,
+        tps: float | None = None,
+        timestamp: str | None = None,
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET last_tokens = ?, last_tps = ?, last_timestamp = ? WHERE thread_id = ?",
+                (tokens, tps, timestamp, thread_id),
             )
             self._conn.commit()
 

@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Generator
 from contextlib import asynccontextmanager, contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -329,13 +330,54 @@ def _serialize_tool_calls(msg: AIMessage) -> list[dict]:
     ]
 
 
+def _collapse_repeated_string(value: str) -> str:
+    # Chunk merging concatenates repeated string fields (e.g. OpenRouter sends
+    # `model` in every stream chunk, so merged metadata becomes "modelmodel").
+    n = len(value)
+    for size in range(1, n // 2 + 1):
+        if n % size == 0 and value[:size] * (n // size) == value:
+            return value[:size]
+    return value
+
+
 def _get_model_from_message(msg: Any) -> str | None:
     metadata = getattr(msg, "response_metadata", None)
     if isinstance(metadata, dict):
         model = metadata.get("model_name") or metadata.get("model_id") or metadata.get("model")
         if isinstance(model, str) and model:
-            return model
+            return _collapse_repeated_string(model)
     return None
+
+
+def _get_turn_metadata(messages: list) -> dict[str, Any]:
+    last_ai = None
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            last_ai = msg
+            break
+    if not last_ai:
+        return {}
+    metadata = getattr(last_ai, "response_metadata", None)
+    result: dict[str, Any] = {}
+    if isinstance(metadata, dict):
+        model = metadata.get("model_name") or metadata.get("model_id") or metadata.get("model")
+        if isinstance(model, str) and model:
+            result["model"] = _collapse_repeated_string(model)
+        usage = getattr(last_ai, "usage_metadata", None)
+        if isinstance(usage, dict):
+            tokens = usage.get("output_tokens")
+            if isinstance(tokens, int) and tokens > 0:
+                result["tokens"] = tokens
+        if "tokens" not in result:
+            usage = metadata.get("usage")
+            if isinstance(usage, dict):
+                tokens = usage.get("output_tokens") or usage.get("total_tokens")
+                if isinstance(tokens, int) and tokens > 0:
+                    result["tokens"] = tokens
+    ts = getattr(last_ai, "timestamp", None)
+    if isinstance(ts, (int, float)):
+        result["timestamp"] = ts
+    return result
 
 
 def _is_tool_echo(text: str) -> bool:
@@ -444,13 +486,19 @@ def _get_display_history(
     thread_id: str, db_path: str, store: EncryptedCredentialStore
 ) -> list[dict]:
     raw_messages = _get_history(thread_id, db_path, store)
-    model = None
+    session_model = None
+    session_metrics: dict[str, Any] = {}
     try:
         session = store.get_session(thread_id)
         if isinstance(session, dict):
-            model = session.get("model")
+            session_model = session.get("model")
+            session_metrics = {
+                "tokens": session.get("last_tokens"),
+                "tps": session.get("last_tps"),
+                "timestamp": session.get("last_timestamp"),
+            }
     except Exception:  # noqa: BLE001
-        model = None
+        session_model = None
 
     merged: list[dict] = []
     turn: list = []
@@ -458,14 +506,30 @@ def _get_display_history(
         if isinstance(msg, HumanMessage):
             turn_data = _finalize_turn(_collect_turn_events(turn))
             if turn_data["content"] or turn_data["steps"]:
-                merged.append({"role": "assistant", **turn_data, "model": model})
+                metadata = _get_turn_metadata(turn)
+                merged.append({
+                    "role": "assistant",
+                    **turn_data,
+                    "model": metadata.get("model") or session_model,
+                    "tokens": metadata.get("tokens"),
+                    "tps": metadata.get("tps"),
+                    "timestamp": metadata.get("timestamp"),
+                })
             merged.append({"role": "user", "content": getattr(msg, "content", "") or ""})
             turn = []
         else:
             turn.append(msg)
     turn_data = _finalize_turn(_collect_turn_events(turn))
     if turn_data["content"] or turn_data["steps"]:
-        merged.append({"role": "assistant", **turn_data, "model": model})
+        metadata = _get_turn_metadata(turn)
+        merged.append({
+            "role": "assistant",
+            **turn_data,
+            "model": metadata.get("model") or session_model,
+            "tokens": metadata.get("tokens") or session_metrics.get("tokens"),
+            "tps": metadata.get("tps") or session_metrics.get("tps"),
+            "timestamp": metadata.get("timestamp") or session_metrics.get("timestamp"),
+        })
     return merged
 
 
@@ -508,6 +572,21 @@ def chat(
     response_model = _get_model_from_message(last_message) or settings.llm_model
     try:
         store.update_session_model(req.thread_id, response_model)
+    except Exception:  # noqa: BLE001
+        pass
+    usage = getattr(last_message, "usage_metadata", None)
+    tokens = None
+    if isinstance(usage, dict):
+        output_tokens = usage.get("output_tokens")
+        if isinstance(output_tokens, int) and output_tokens > 0:
+            tokens = output_tokens
+    try:
+        store.update_session_metrics(
+            req.thread_id,
+            tokens=tokens,
+            tps=None,
+            timestamp=datetime.now(UTC).isoformat(),
+        )
     except Exception:  # noqa: BLE001
         pass
     return ChatResponse(response=turn_data["content"], steps=turn_data["steps"], model=response_model)
@@ -620,13 +699,22 @@ def chat_stream(
             if not turn_data["content"] and collected_ais:
                 turn_data["content"] = _message_text(collected_ais[-1]).strip()
             store._touch_session(req.thread_id)
+            elapsed = max(__import__("time").monotonic() - start_time, 0.001)
+            tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None
             if response_model:
                 try:
                     store.update_session_model(req.thread_id, response_model)
                 except Exception:  # noqa: BLE001
                     pass
-            elapsed = max(__import__("time").monotonic() - start_time, 0.001)
-            tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None
+            try:
+                store.update_session_metrics(
+                    req.thread_id,
+                    tokens=total_output_tokens or None,
+                    tps=tps,
+                    timestamp=__import__("datetime").datetime.now(UTC).isoformat(),
+                )
+            except Exception:  # noqa: BLE001
+                pass
             yield _sse(
                 {
                     "type": "done",
