@@ -50,7 +50,7 @@ type ChatMessage = {
   steps?: AgentStep[]
   tokens?: number
   tps?: number
-  timestamp?: number
+  timestamp?: number | string
   model?: string
 }
 
@@ -64,6 +64,32 @@ function normalizeChatMessage(raw: Partial<ChatMessage> & { role: string }): Cha
     timestamp: raw.timestamp,
     model: raw.model,
   }
+}
+
+function getTimestampValue(timestamp?: number | string): number | null {
+  if (timestamp === undefined || timestamp === null) return null
+  const value = typeof timestamp === 'number'
+    ? timestamp < 1e12 ? timestamp * 1000 : timestamp
+    : Date.parse(timestamp)
+  return Number.isFinite(value) ? value : null
+}
+
+function MessageTimestamp({ timestamp, align }: { timestamp?: number | string; align: 'left' | 'right' }) {
+  const value = getTimestampValue(timestamp)
+  if (value === null) return null
+  return (
+    <time
+      dateTime={new Date(value).toISOString()}
+      className={`mt-1 block text-[10px] text-[var(--text-quaternary)] ${align === 'right' ? 'text-right' : 'text-left'}`}
+    >
+      {new Intl.DateTimeFormat(undefined, {
+        month: 'short',
+        day: 'numeric',
+        hour: 'numeric',
+        minute: '2-digit',
+      }).format(new Date(value))}
+    </time>
+  )
 }
 
 function getThreadIdFromSearch(search?: string): string | undefined {
@@ -288,8 +314,11 @@ function MessageBubble({ msg, isLatest, streaming }: {
   if (isUser) {
     return (
       <div className="flex justify-end fade-in">
-        <div className="max-w-[85%] sm:max-w-[75%] px-4 py-2.5 rounded-2xl bg-[var(--accent)] text-white text-[0.9375rem] leading-relaxed whitespace-pre-wrap break-words">
-          {msg.content}
+        <div className="max-w-[85%] sm:max-w-[75%]">
+          <div className="px-4 py-2.5 rounded-2xl bg-[var(--accent)] text-white text-[0.9375rem] leading-relaxed whitespace-pre-wrap break-words">
+            {msg.content}
+          </div>
+          <MessageTimestamp timestamp={msg.timestamp} align="right" />
         </div>
       </div>
     )
@@ -297,7 +326,7 @@ function MessageBubble({ msg, isLatest, streaming }: {
   const showCursor = streaming && isLatest
   return (
     <div className="flex justify-start fade-in">
-      <div className="max-w-[85%] sm:max-w-[75%] min-w-0">
+      <div className="max-w-[95%] sm:max-w-[90%] min-w-0">
         <StepTrace steps={msg.steps} live={streaming && isLatest} />
         {msg.content && (
           <>
@@ -324,6 +353,7 @@ function MessageBubble({ msg, isLatest, streaming }: {
             )}
           </>
         )}
+        <MessageTimestamp timestamp={msg.timestamp} align="left" />
       </div>
     </div>
   )
