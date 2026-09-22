@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, type KeyboardEvent } from 'react'
+import { useState, useEffect, useRef, type KeyboardEvent, type ReactNode } from 'react'
 import { useNavigate, useLocation } from '@tanstack/react-router'
 import {
   Send,
@@ -118,10 +118,10 @@ function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean;
       </button>
       {open && (
         <div className="mt-1.5 px-3 py-2 rounded-lg bg-[var(--bg-subtle)] border border-[var(--border-subtle)] text-[var(--text-secondary)] leading-relaxed">
-          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
-            {text}
-          </ReactMarkdown>
-          {live && <span className="streaming-cursor" />}
+          <MarkdownContent
+            content={text}
+            trailing={live ? <span className="streaming-cursor" /> : undefined}
+          />
         </div>
       )}
     </div>
@@ -224,9 +224,9 @@ function StepTrace({ steps, live }: { steps?: AgentStep[]; live?: boolean }) {
   )
 }
 
-function MarkdownContent({ content }: { content: string }) {
+function MarkdownContent({ content, trailing }: { content: string; trailing?: ReactNode }) {
   return (
-    <div className="markdown-body">
+    <div className={`markdown-body${trailing ? ' markdown-body-with-cursor' : ''}`}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw]}
@@ -240,6 +240,7 @@ function MarkdownContent({ content }: { content: string }) {
       >
         {content}
       </ReactMarkdown>
+      {trailing}
     </div>
   )
 }
@@ -301,8 +302,10 @@ function MessageBubble({ msg, isLatest, streaming }: {
         {msg.content && (
           <>
             <div className="px-4 py-3 rounded-2xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[0.9375rem] text-[var(--text-primary)]">
-              <MarkdownContent content={msg.content} />
-              {showCursor && !msg.content.endsWith(' ') && <span className="streaming-cursor" />}
+              <MarkdownContent
+                content={msg.content}
+                trailing={showCursor && !msg.content.endsWith(' ') ? <span className="streaming-cursor" /> : undefined}
+              />
             </div>
             {!streaming && msg.content && (
               <div className="mt-1.5 flex items-center gap-2">
@@ -320,11 +323,6 @@ function MessageBubble({ msg, isLatest, streaming }: {
               </div>
             )}
           </>
-        )}
-        {!msg.content && streaming && isLatest && (
-          <div className="px-4 py-3 rounded-2xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--text-tertiary)] text-sm">
-            <span className="typing-dots"><span /><span /><span /></span>
-          </div>
         )}
       </div>
     </div>
