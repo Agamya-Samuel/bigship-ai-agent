@@ -166,7 +166,7 @@ def test_collect_turn_events_includes_tool_results() -> None:
     assert events == [
         {"type": "tool_call", "tool_call_id": "tc1", "name": "get_profile", "args": {}},
         {"type": "tool_result", "tool_call_id": "tc1", "name": "get_profile", "result": '{\n  "status": true\n}'},
-        {"type": "text", "text": "Here is your profile."},
+        {"type": "text", "kind": "answer", "text": "Here is your profile."},
     ]
 
 
@@ -205,4 +205,151 @@ def test_genuinely_orphaned_tool_call_is_dropped() -> None:
     out = _strip_orphaned_tool_calls(msgs, _FakeSaver(), "t1")
     assert out == msgs[:1]
     assert deleted == ["t1"]
+
+
+def test_collect_turn_events_tags_tool_calling_text_as_reasoning() -> None:
+    """An AIMessage that emits a preface ("I'll first...") AND a tool_call
+    must be tagged kind=reasoning so _finalize_turn never surfaces the
+    preface as the user-visible answer."""
+    import agent.service as svc
+
+    raw = [
+        AIMessage(
+            content="I'll first retrieve the available payment modes.",
+            tool_calls=[{"id": "tc1", "name": "get_payment_modes", "args": {"segment_type": "domestic_b2c"}, "type": "tool_call"}],
+        ),
+    ]
+    events = svc._collect_turn_events(raw)
+    text_events = [e for e in events if e["type"] == "text"]
+    assert len(text_events) == 1
+    assert text_events[0]["kind"] == "reasoning"
+    assert text_events[0]["text"] == "I'll first retrieve the available payment modes."
+
+
+def test_finalize_turn_picks_last_answer_not_last_reasoning() -> None:
+    """The bug: model emits a preface before tool calls and then never
+    produces answer content. _finalize_turn must return empty content
+    instead of leaking the preface."""
+    from agent.service import _collect_turn_events, _finalize_turn
+
+    raw = [
+        AIMessage(
+            content="I'll first retrieve the available domestic B2C payment modes.",
+            tool_calls=[{"id": "tc1", "name": "get_payment_modes", "args": {"segment_type": "domestic_b2c"}, "type": "tool_call"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc2", "name": "get_risk_types", "args": {}, "type": "tool_call"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc3", "name": "calculate_rate", "args": {}, "type": "tool_call"}],
+        ),
+        # Final answer AIMessage: empty content (truncated by reasoning).
+        AIMessage(content="", response_metadata={"finish_reason": "length"}),
+    ]
+    turn_data = _finalize_turn(_collect_turn_events(raw))
+    assert turn_data["content"] == ""
+    # Reasoning text must be preserved as a step (so users still see what
+    # the agent was thinking), not promoted to the answer.
+    reasoning_steps = [s for s in turn_data["steps"] if s.get("type") == "reasoning"]
+    assert len(reasoning_steps) == 1
+    assert "I'll first retrieve" in reasoning_steps[0]["text"]
+
+
+def test_answer_was_truncated_by_reasoning_detects_finish_reason_length() -> None:
+    """The detection helper must fire when the final AIMessage has empty
+    content and finish_reason=length (the failure mode)."""
+    from agent.service import _answer_was_truncated_by_reasoning
+
+    msgs = [
+        HumanMessage(content="calc rate"),
+        AIMessage(content="I'll first...", tool_calls=[{"id": "tc1", "name": "calculate_rate", "args": {}}]),
+        AIMessage(content="", response_metadata={"finish_reason": "length"}),
+    ]
+    assert _answer_was_truncated_by_reasoning(msgs) is True
+
+
+def test_answer_was_truncated_by_reasoning_returns_false_for_normal_turn() -> None:
+    """A successful turn with a real answer must not trigger a retry."""
+    from agent.service import _answer_was_truncated_by_reasoning
+
+    msgs = [
+        HumanMessage(content="hi"),
+        AIMessage(content="Hello! How can I help?"),
+    ]
+    assert _answer_was_truncated_by_reasoning(msgs) is False
+
+
+def test_answer_was_truncated_by_reasoning_returns_false_for_pending_tool_call() -> None:
+    """A final AIMessage that emits a tool_call (no finish_reason yet) must
+    not be classified as a reasoning-truncation failure."""
+    from agent.service import _answer_was_truncated_by_reasoning
+
+    msgs = [
+        HumanMessage(content="calc"),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc1", "name": "calculate_rate", "args": {}}],
+            response_metadata={"finish_reason": "tool_calls"},
+        ),
+    ]
+    assert _answer_was_truncated_by_reasoning(msgs) is False
+
+
+def test_three_tool_calls_then_truncated_does_not_leak_preface() -> None:
+    """End-to-end shape of the user-reported failure: get_payment_modes,
+    get_risk_types, calculate_rate all succeed, then the final AIMessage
+    is empty (truncated by reasoning). The chat response must NOT be the
+    preface text."""
+    from agent.service import _collect_turn_events, _finalize_turn
+
+    raw = [
+        AIMessage(
+            content="I'll first retrieve the available domestic B2C payment modes and risk categories so I can select cash on delivery and the no-risk option, then I'll calculate the rate for the specified box.",
+            tool_calls=[{"id": "tc1", "name": "get_payment_modes", "args": {"segment_type": "domestic_b2c"}, "type": "tool_call"}],
+        ),
+        AIMessage(content="{'status': True, 'data': [...]}", tool_calls=[]),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc2", "name": "get_risk_types", "args": {}, "type": "tool_call"}],
+        ),
+        AIMessage(content="{'status': True, 'data': [...]}", tool_calls=[]),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc3", "name": "calculate_rate", "args": {}, "type": "tool_call"}],
+        ),
+        AIMessage(content="{'status': True, 'data': {...rates...}}", tool_calls=[]),
+        AIMessage(content="", response_metadata={"finish_reason": "length"}),
+    ]
+    turn_data = _finalize_turn(_collect_turn_events(raw))
+    assert not turn_data["content"]
+    assert "I'll first retrieve" not in turn_data["content"]
+
+
+def test_successful_three_tool_call_turn_keeps_answer() -> None:
+    """Regression guard: a normal successful turn with a real answer must
+    continue to surface that answer, with reasoning kept as a step."""
+    from agent.service import _collect_turn_events, _finalize_turn
+
+    raw = [
+        AIMessage(
+            content="I'll first retrieve the payment modes.",
+            tool_calls=[{"id": "tc1", "name": "get_payment_modes", "args": {"segment_type": "domestic_b2c"}, "type": "tool_call"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc2", "name": "get_risk_types", "args": {}, "type": "tool_call"}],
+        ),
+        AIMessage(
+            content="",
+            tool_calls=[{"id": "tc3", "name": "calculate_rate", "args": {}, "type": "tool_call"}],
+        ),
+        AIMessage(content="Here are the shipping rates for your 15 kg package..."),
+    ]
+    turn_data = _finalize_turn(_collect_turn_events(raw))
+    assert turn_data["content"] == "Here are the shipping rates for your 15 kg package..."
+    reasoning_steps = [s for s in turn_data["steps"] if s.get("type") == "reasoning"]
+    assert len(reasoning_steps) == 1
+    assert "I'll first retrieve" in reasoning_steps[0]["text"]
 

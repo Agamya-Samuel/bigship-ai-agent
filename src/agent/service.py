@@ -478,6 +478,37 @@ def _reasoning_delta_from_chunk(chunk: Any) -> str:
     return ""
 
 
+def _finish_reason(msg: Any) -> str | None:
+    metadata = getattr(msg, "response_metadata", None)
+    if isinstance(metadata, dict):
+        reason = metadata.get("finish_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    return None
+
+
+def _answer_was_truncated_by_reasoning(messages: list) -> bool:
+    """True if the final AIMessage had no answer text and was cut off mid-run.
+
+    A reasoning model that emits reasoning chunks and then runs out of
+    output tokens before producing any answer content ends with
+    finish_reason="length" and an empty answer. In that case the service
+    layer should retry with reasoning disabled rather than surface a
+    truncated or reasoning-leaked response.
+    """
+    for msg in reversed(messages):
+        if isinstance(msg, AIMessage):
+            if getattr(msg, "tool_calls", None):
+                return False
+            text = _message_text(msg).strip()
+            if text:
+                return False
+            extra = getattr(msg, "additional_kwargs", {}) or {}
+            reasoning = extra.get("reasoning_content") if isinstance(extra, dict) else None
+            return bool(reasoning) or _finish_reason(msg) == "length"
+    return False
+
+
 def _collect_turn_events(messages: list) -> list[dict]:
     events: list[dict] = []
     tool_call_map: dict[str, str] = {}
@@ -486,10 +517,13 @@ def _collect_turn_events(messages: list) -> list[dict]:
             extra = getattr(msg, "additional_kwargs", {}) or {}
             reasoning = extra.get("reasoning_content") if isinstance(extra, dict) else None
             if isinstance(reasoning, str) and reasoning.strip():
-                events.append({"type": "text", "text": reasoning.strip()})
+                events.append({"type": "text", "kind": "reasoning", "text": reasoning.strip()})
             text = _message_text(msg).strip()
             if text and not _is_tool_echo(text):
-                events.append({"type": "text", "text": text})
+                # An AIMessage that issues tool_calls but also has a "I'll first..."
+                # preface in its content is a reasoning message, not an answer.
+                kind = "reasoning" if getattr(msg, "tool_calls", None) else "answer"
+                events.append({"type": "text", "kind": kind, "text": text})
             for tc in _serialize_tool_calls(msg):
                 tool_call_map[tc["tool_call_id"]] = tc["name"]
                 events.append({"type": "tool_call", **tc})
@@ -515,16 +549,24 @@ def _collect_turn_events(messages: list) -> list[dict]:
 
 
 def _finalize_turn(events: list[dict]) -> dict[str, Any]:
-    final_idx = -1
+    # Pick the LAST answer text as the user-visible content. Reasoning text is
+    # always demoted to a step trace, never shown as the final answer, so a
+    # reasoning model that emits a "I'll first..." preface before its tool
+    # calls (or whose reasoning budget consumes the output limit and leaves
+    # no answer) cannot leak that preface into the user-visible response.
+    answer_idx = -1
     for i, ev in enumerate(events):
+        if ev["type"] == "text" and ev.get("kind") == "answer":
+            answer_idx = i
+    content = events[answer_idx]["text"] if answer_idx != -1 else ""
+    steps: list[dict] = []
+    for i, ev in enumerate(events):
+        if i == answer_idx:
+            continue
         if ev["type"] == "text":
-            final_idx = i
-    content = events[final_idx]["text"] if final_idx != -1 else ""
-    steps = [
-        {"type": "reasoning", "text": ev["text"]} if ev["type"] == "text" else ev
-        for i, ev in enumerate(events)
-        if i != final_idx
-    ]
+            steps.append({"type": "reasoning", "text": ev["text"]})
+        else:
+            steps.append(ev)
     return {"content": content, "steps": steps}
 
 
@@ -579,6 +621,82 @@ def _get_display_history(
     return merged
 
 
+def _reset_thread_state(thread_id: str, db_path: str) -> None:
+    """Drop all langgraph checkpoints for `thread_id` so the next invoke sees
+    a fresh state. Used before a retry-with-no-reasoning attempt so the
+    retry doesn't replay the partial reasoning-only run as if it were real
+    history."""
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        SqliteSaver(conn).delete_thread(thread_id)
+    except Exception:  # noqa: BLE001
+        logger.warning("Could not reset thread state for retry thread_id=%s", thread_id)
+    finally:
+        conn.close()
+
+
+def _run_agent(  # type: ignore[no-untyped-def]
+    graph,
+    *,
+    config: dict[str, Any],
+    history: list,
+    user_message: str,
+    thread_id: str,
+    checkpoint_db_path: str,
+):
+    """Invoke the agent once; if the final AIMessage has no answer content
+    (typically because a reasoning model exhausted its output budget on
+    thinking), retry once with reasoning disabled and a reset thread state
+    so the user gets a real answer instead of a truncated reasoning leak."""
+    try:
+        result = graph.invoke(
+            {"messages": history + [HumanMessage(content=user_message)]},
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Agent execution failed for thread_id=%s", thread_id)
+        if _is_rate_limit_error(exc):
+            retry_after = _rate_limit_retry_after(exc)
+            headers = {"Retry-After": str(retry_after)} if retry_after else None
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please retry shortly.",
+                headers=headers,
+            ) from exc
+        raise HTTPException(status_code=500, detail="Agent execution failed") from exc
+
+    if not _answer_was_truncated_by_reasoning(result["messages"]):
+        return result, history
+
+    logger.info(
+        "Retrying agent thread_id=%s with reasoning disabled "
+        "(final AIMessage had no answer content)",
+        thread_id,
+    )
+    _reset_thread_state(thread_id, checkpoint_db_path)
+    history = []  # the retry should see a clean thread
+    retry_graph = build_graph(checkpoint_db_path, disable_reasoning=True)
+    try:
+        result = retry_graph.invoke(
+            {"messages": [HumanMessage(content=user_message)]},
+            config=config,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Agent retry failed for thread_id=%s", thread_id)
+        if _is_rate_limit_error(exc):
+            retry_after = _rate_limit_retry_after(exc)
+            headers = {"Retry-After": str(retry_after)} if retry_after else None
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please retry shortly.",
+                headers=headers,
+            ) from exc
+        raise HTTPException(status_code=500, detail="Agent execution failed") from exc
+    return result, history
+
+
 @app.post("/chat", response_model=ChatResponse)
 def chat(
     req: ChatRequest,
@@ -594,34 +712,31 @@ def chat(
     store.get_or_create_client(req.thread_id)
 
     history = _get_history(req.thread_id, settings.checkpoint_db_path, store)
-    graph = build_graph(settings.checkpoint_db_path)
     config: dict[str, Any] = {
         "configurable": {"thread_id": req.thread_id, "account_id": account_id},
         "metadata": {"account_id": account_id, "thread_id": req.thread_id},
         "recursion_limit": settings.max_tool_calls + 2,
     }
-    try:
-        result = graph.invoke(
-            {"messages": history + [HumanMessage(content=req.message)]},
-            config=config,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Agent execution failed for thread_id=%s", req.thread_id)
-        if _is_rate_limit_error(exc):
-            retry_after = _rate_limit_retry_after(exc)
-            headers = {"Retry-After": str(retry_after)} if retry_after else None
-            raise HTTPException(
-                status_code=429,
-                detail="Rate limit exceeded. Please retry shortly.",
-                headers=headers,
-            ) from exc
-        raise HTTPException(status_code=500, detail="Agent execution failed") from exc
+    graph = build_graph(settings.checkpoint_db_path)
+    result, history = _run_agent(
+        graph,
+        config=config,
+        history=history,
+        user_message=req.message,
+        thread_id=req.thread_id,
+        checkpoint_db_path=settings.checkpoint_db_path,
+    )
 
     last_message = result["messages"][-1]
     input_length = len(history) + 1
     turn_data = _finalize_turn(_collect_turn_events(result["messages"][input_length:]))
+    # Only fall back to the last AIMessage's raw content if it's a genuine
+    # final answer (no tool_calls). Otherwise we'd surface reasoning content
+    # as the response when the model's reasoning budget consumed the output
+    # limit and no answer text was produced.
     if not turn_data["content"]:
-        turn_data["content"] = str(getattr(last_message, "content", "") or "")
+        if isinstance(last_message, AIMessage) and not getattr(last_message, "tool_calls", None):
+            turn_data["content"] = _message_text(last_message).strip()
     store._touch_session(req.thread_id)
     response_model = _get_model_from_message(last_message) or settings.llm_model
     try:
@@ -670,88 +785,149 @@ def chat_stream(
     def _sse(event: dict[str, Any]) -> str:
         return f"data: {json.dumps(event)}\n\n"
 
-    def generate() -> Generator[str, None, None]:
+    def _stream_attempt(  # type: ignore[no-untyped-def]
+        attempt_graph, attempt_history
+    ) -> Generator[tuple[str, list[AIMessage], int, str | None, list[dict]], None, None]:
+        """Run one graph.stream pass; yield (sse_chunk, collected_ais, total_output_tokens, response_model, turn_events) for the outer generator to forward.
+
+        The outer generator can decide whether to retry based on
+        collected_ais / total_output_tokens once the inner pass completes.
+        """
         turn_events: list[dict] = []
         tool_call_map: dict[str, str] = {}
         collected_ais: list[AIMessage] = []
+        total_output_tokens = 0
+        response_model: str | None = None
+        for mode, payload in attempt_graph.stream(
+            {"messages": attempt_history + [HumanMessage(content=req.message)]},
+            config=config,
+            stream_mode=["messages", "updates"],
+        ):
+            if mode == "messages":
+                chunk, meta = payload
+                if not isinstance(chunk, AIMessageChunk):
+                    continue
+                if not isinstance(meta, dict) or meta.get("langgraph_node") != "agent":
+                    continue
+                if response_model is None:
+                    response_model = _get_model_from_message(chunk)
+                usage = getattr(chunk, "usage_metadata", None)
+                if isinstance(usage, dict):
+                    output_tokens = usage.get("output_tokens")
+                    if isinstance(output_tokens, int) and output_tokens > 0:
+                        total_output_tokens = output_tokens
+                reasoning_delta = _reasoning_delta_from_chunk(chunk)
+                if reasoning_delta:
+                    turn_events.append(
+                        {"type": "text", "kind": "reasoning", "text": reasoning_delta}
+                    )
+                    yield _sse({"type": "reasoning_delta", "text": reasoning_delta}), collected_ais, total_output_tokens, response_model, turn_events
+                text_delta = _message_text(chunk)
+                if text_delta:
+                    turn_events.append(
+                        {"type": "text", "kind": "reasoning", "text": text_delta}
+                    )
+                    yield _sse({"type": "text_delta", "text": text_delta}), collected_ais, total_output_tokens, response_model, turn_events
+            elif mode == "updates":
+                if not isinstance(payload, dict):
+                    continue
+                update = payload.get("agent")
+                if isinstance(update, dict):
+                    for m in update.get("messages", []):
+                        if not isinstance(m, AIMessage):
+                            continue
+                        collected_ais.append(m)
+                        if not m.tool_calls:
+                            continue
+                        text = _message_text(m).strip()
+                        if text and not _is_tool_echo(text):
+                            turn_events.append(
+                                {"type": "text", "kind": "reasoning", "text": text}
+                            )
+                            yield _sse({"type": "reasoning", "text": text}), collected_ais, total_output_tokens, response_model, turn_events
+                        for tc in _serialize_tool_calls(m):
+                            tool_call_map[tc["tool_call_id"]] = tc["name"]
+                            turn_events.append({"type": "tool_call", **tc})
+                            yield _sse({"type": "tool_call", **tc}), collected_ais, total_output_tokens, response_model, turn_events
+                update = payload.get("tools")
+                if isinstance(update, dict):
+                    for m in update.get("messages", []):
+                        if not isinstance(m, ToolMessage):
+                            continue
+                        collected_ais.append(m)
+                        tc_id = getattr(m, "tool_call_id", "")
+                        name = tool_call_map.get(tc_id, "")
+                        result = _normalize_tool_result(_message_text(m))
+                        result_event = {
+                            "type": "tool_result",
+                            "tool_call_id": tc_id,
+                            "name": name,
+                            "result": result,
+                        }
+                        insert_idx = len(turn_events)
+                        for i in range(len(turn_events) - 1, -1, -1):
+                            if (
+                                turn_events[i].get("type") == "tool_call"
+                                and turn_events[i].get("tool_call_id") == tc_id
+                            ):
+                                insert_idx = i + 1
+                                break
+                        turn_events.insert(insert_idx, result_event)
+                        yield _sse(result_event), collected_ais, total_output_tokens, response_model, turn_events
+        return
+
+    def generate() -> Generator[str, None, None]:
         start_time = __import__("time").monotonic()
         total_output_tokens = 0
         response_model: str | None = None
         try:
             yield _sse({"type": "start"})
-            for mode, payload in graph.stream(
-                {"messages": history + [HumanMessage(content=req.message)]},
-                config=config,
-                stream_mode=["messages", "updates"],
+            attempt_graph = graph
+            attempt_history = history
+            for sse_chunk, collected_ais, attempt_tokens, attempt_model, _ in _stream_attempt(
+                attempt_graph, attempt_history
             ):
-                if mode == "messages":
-                    chunk, meta = payload
-                    if not isinstance(chunk, AIMessageChunk):
-                        continue
-                    if not isinstance(meta, dict) or meta.get("langgraph_node") != "agent":
-                        continue
-                    if response_model is None:
-                        response_model = _get_model_from_message(chunk)
-                    usage = getattr(chunk, "usage_metadata", None)
-                    if isinstance(usage, dict):
-                        output_tokens = usage.get("output_tokens")
-                        if isinstance(output_tokens, int) and output_tokens > 0:
-                            total_output_tokens = output_tokens
-                    reasoning_delta = _reasoning_delta_from_chunk(chunk)
-                    if reasoning_delta:
-                        yield _sse({"type": "reasoning_delta", "text": reasoning_delta})
-                        turn_events.append({"type": "text", "text": reasoning_delta})
-                    text_delta = _message_text(chunk)
-                    if text_delta:
-                        yield _sse({"type": "text_delta", "text": text_delta})
-                        turn_events.append({"type": "text", "text": text_delta})
-                elif mode == "updates":
-                    if not isinstance(payload, dict):
-                        continue
-                    update = payload.get("agent")
-                    if isinstance(update, dict):
-                        for m in update.get("messages", []):
-                            if not isinstance(m, AIMessage):
-                                continue
-                            collected_ais.append(m)
-                            if not m.tool_calls:
-                                continue
-                            text = _message_text(m).strip()
-                            if text and not _is_tool_echo(text):
-                                yield _sse({"type": "reasoning", "text": text})
-                                turn_events.append({"type": "text", "text": text})
-                            for tc in _serialize_tool_calls(m):
-                                tool_call_map[tc["tool_call_id"]] = tc["name"]
-                                turn_events.append({"type": "tool_call", **tc})
-                                yield _sse({"type": "tool_call", **tc})
-                    update = payload.get("tools")
-                    if isinstance(update, dict):
-                        for m in update.get("messages", []):
-                            if not isinstance(m, ToolMessage):
-                                continue
-                            collected_ais.append(m)
-                            tc_id = getattr(m, "tool_call_id", "")
-                            name = tool_call_map.get(tc_id, "")
-                            result = _normalize_tool_result(_message_text(m))
-                            result_event = {
-                                "type": "tool_result",
-                                "tool_call_id": tc_id,
-                                "name": name,
-                                "result": result,
-                            }
-                            insert_idx = len(turn_events)
-                            for i in range(len(turn_events) - 1, -1, -1):
-                                if (
-                                    turn_events[i].get("type") == "tool_call"
-                                    and turn_events[i].get("tool_call_id") == tc_id
-                                ):
-                                    insert_idx = i + 1
-                                    break
-                            turn_events.insert(insert_idx, result_event)
-                            yield _sse(result_event)
+                total_output_tokens = attempt_tokens or total_output_tokens
+                if response_model is None and attempt_model:
+                    response_model = attempt_model
+                yield sse_chunk
+
+            # First attempt complete. If the run produced no answer content
+            # (a reasoning model spent its output budget on thinking), retry
+            # once with reasoning disabled.
+            truncated = _answer_was_truncated_by_reasoning(collected_ais)
+            if truncated:
+                logger.info(
+                    "Streaming retry thread_id=%s: first attempt had no answer "
+                    "content, retrying with reasoning disabled",
+                    req.thread_id,
+                )
+                yield _sse(
+                    {
+                        "type": "reasoning_truncated",
+                        "detail": "Reasoning consumed the output budget; retrying without reasoning.",
+                    }
+                )
+                _reset_thread_state(req.thread_id, settings.checkpoint_db_path)
+                retry_graph = build_graph(settings.checkpoint_db_path, disable_reasoning=True)
+                total_output_tokens = 0
+                response_model = None
+                yield _sse({"type": "retry_start"})
+                for sse_chunk, collected_ais, attempt_tokens, attempt_model, _ in _stream_attempt(
+                    retry_graph, []
+                ):
+                    total_output_tokens = attempt_tokens or total_output_tokens
+                    if response_model is None and attempt_model:
+                        response_model = attempt_model
+                    yield sse_chunk
+
             turn_data = _finalize_turn(_collect_turn_events(collected_ais))
             if not turn_data["content"] and collected_ais:
-                turn_data["content"] = _message_text(collected_ais[-1]).strip()
+                last = collected_ais[-1]
+                if isinstance(last, AIMessage) and not getattr(last, "tool_calls", None):
+                    fallback = _message_text(last).strip()
+                    if fallback and not _is_tool_echo(fallback):
+                        turn_data["content"] = fallback
             store._touch_session(req.thread_id)
             elapsed = max(__import__("time").monotonic() - start_time, 0.001)
             tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None

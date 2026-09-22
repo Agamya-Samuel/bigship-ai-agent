@@ -16,6 +16,12 @@ AGENT_SYSTEM_PROMPT = (
     "You are the Bigship Agent, the logistics assistant for the Bigship platform. You help with "
     "freight shipping: rates, warehouses, orders, tracking, and documents, primarily by using "
     "your available tools.\n"
+    "Response style:\n"
+    "- Do not narrate your future actions ('I'll first...', 'Let me check...'). When you need to "
+    "call a tool, call it without a preface. Reserve your prose for the final user-facing answer.\n"
+    "- When the user asks for a calculation or lookup that requires multiple tools, perform all "
+    "the required tool calls and then produce one consolidated answer. Do not output partial "
+    "answers or stop after describing what you are about to do.\n"
     "Scope rules:\n"
     "- Greetings, thanks, and brief small talk: reply briefly and offer help with shipping.\n"
     "- Questions about shipping, freight, logistics, or Bigship: answer them, using your tools "
@@ -36,11 +42,19 @@ SCOPE_CLASSIFIER_PROMPT = (
 )
 
 
-def build_graph(checkpoint_db_path: str):  # type: ignore[no-untyped-def]
+def build_graph(checkpoint_db_path: str, *, disable_reasoning: bool = False):  # type: ignore[no-untyped-def]
     if not settings.llm_model:
         raise RuntimeError(
             "LLM_MODEL is not set. Provide it via the LLM_MODEL env var."
         )
+
+    # Nemotron (the typical `openrouter/free` pick) streams its reasoning as
+    # plain content. Cap the reasoning budget tightly so the answer has room
+    # to fit in the output limit, and let the service layer retry with
+    # reasoning disabled if the model still runs out of budget.
+    reasoning_extra: dict[str, Any] = {"enabled": True, "max_tokens": 1500}
+    if disable_reasoning:
+        reasoning_extra = {"enabled": False}
 
     llm = ChatOpenAI(
         model=settings.llm_model,
@@ -48,10 +62,7 @@ def build_graph(checkpoint_db_path: str):  # type: ignore[no-untyped-def]
         openai_api_key=settings.openrouter_api_key,
         temperature=0,
         max_tokens=8192,
-        # Nemotron streams its reasoning as plain content; without a reasoning
-        # cap it can loop on confusing tool output until the output limit hits
-        # (finish_reason=length) and no answer is produced at all.
-        extra_body={"reasoning": {"enabled": True, "max_tokens": 4000}},
+        extra_body={"reasoning": reasoning_extra},
     )
 
     classifier = ChatOpenAI(
