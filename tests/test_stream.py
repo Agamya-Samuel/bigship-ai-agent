@@ -153,3 +153,81 @@ def test_chat_stream_survives_graph_error(init_store, account_id: str, monkeypat
                 events.append(json.loads(line[6:]))
 
     assert events[-1]["type"] == "error"
+
+
+class _RateLimitError(Exception):
+    def __init__(self, headers=None, body=None):  # noqa: ANN001
+        super().__init__("429")
+        self.status_code = 429
+        self.response = type("R", (), {"headers": headers or {}})()
+        self.body = body
+
+
+class _RateLimitedGraph:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def stream(self, inp, config=None, stream_mode=None, **kwargs):  # noqa: ANN001, ANN003
+        raise self._exc
+        yield  # pragma: no cover
+
+
+def _stream_events(monkeypatch, svc, graph) -> list:
+    monkeypatch.setattr(svc, "build_graph", lambda path: graph)
+    headers = _auth_headers()
+    resp = client.post("/sessions", json={"label": "s"}, headers=headers)
+    thread_id = resp.json()["thread_id"]
+    with client.stream(
+        "POST", "/chat/stream", json={"thread_id": thread_id, "message": "hi"}, headers=headers
+    ) as resp:
+        assert resp.status_code == 200
+        events = []
+        for line in resp.iter_lines():
+            if line.startswith("data: "):
+                events.append(json.loads(line[6:]))
+    return events
+
+
+def test_chat_stream_rate_limit_uses_retry_after_header(
+    init_store, account_id: str, monkeypatch
+) -> None:
+    from agent import service as svc
+
+    events = _stream_events(
+        monkeypatch, svc, _RateLimitedGraph(_RateLimitError(headers={"retry-after": "7"}))
+    )
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["error_type"] == "rate_limited"
+    assert error["retry_after"] == 7
+
+
+def test_chat_stream_rate_limit_uses_body_reset_metadata(
+    init_store, account_id: str, monkeypatch
+) -> None:
+    import time
+
+    from agent import service as svc
+
+    reset_ms = str(int((time.time() + 30) * 1000))
+    body = {"error": {"code": 429, "metadata": {"x-ratelimit-reset": reset_ms}}}
+    events = _stream_events(monkeypatch, svc, _RateLimitedGraph(_RateLimitError(body=body)))
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["error_type"] == "rate_limited"
+    assert 20 <= error["retry_after"] <= 35
+
+
+def test_chat_stream_rate_limit_without_retry_hint(
+    init_store, account_id: str, monkeypatch
+) -> None:
+    from agent import service as svc
+
+    events = _stream_events(monkeypatch, svc, _RateLimitedGraph(_RateLimitError()))
+
+    error = events[-1]
+    assert error["type"] == "error"
+    assert error["error_type"] == "rate_limited"
+    assert error["retry_after"] is None

@@ -4,6 +4,7 @@ import ast
 import json
 import logging
 import sqlite3
+import time
 import uuid
 from collections.abc import AsyncIterator, Generator
 from contextlib import asynccontextmanager, contextmanager
@@ -349,6 +350,51 @@ def _get_model_from_message(msg: Any) -> str | None:
     return None
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    return getattr(exc, "status_code", None) == 429
+
+
+def _rate_limit_retry_after(exc: Exception) -> int | None:
+    """Best-effort seconds until the OpenRouter rate limit resets.
+
+    Checks the Retry-After header, then x-ratelimit-reset (epoch ms in the
+    JSON body metadata or seconds in headers).
+    """
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    candidates: list[str] = []
+    if headers is not None:
+        retry_after = headers.get("retry-after")
+        if retry_after:
+            try:
+                return max(1, int(float(retry_after)))
+            except (TypeError, ValueError):
+                pass
+        reset = headers.get("x-ratelimit-reset")
+        if reset:
+            candidates.append(str(reset))
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        metadata = error.get("metadata") if isinstance(error, dict) else None
+        if isinstance(metadata, dict) and metadata.get("x-ratelimit-reset"):
+            candidates.append(str(metadata["x-ratelimit-reset"]))
+    for candidate in candidates:
+        try:
+            value = float(candidate)
+        except (TypeError, ValueError):
+            continue
+        if value > 1e11:  # epoch milliseconds
+            seconds = value / 1000 - time.time()
+        elif value > 1e9:  # epoch seconds
+            seconds = value - time.time()
+        else:  # relative seconds
+            seconds = value
+        if seconds > 0:
+            return min(int(seconds) + 1, 86400)
+    return None
+
+
 def _get_turn_metadata(messages: list) -> dict[str, Any]:
     last_ai = None
     for msg in reversed(messages):
@@ -561,6 +607,14 @@ def chat(
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("Agent execution failed for thread_id=%s", req.thread_id)
+        if _is_rate_limit_error(exc):
+            retry_after = _rate_limit_retry_after(exc)
+            headers = {"Retry-After": str(retry_after)} if retry_after else None
+            raise HTTPException(
+                status_code=429,
+                detail="Rate limit exceeded. Please retry shortly.",
+                headers=headers,
+            ) from exc
         raise HTTPException(status_code=500, detail="Agent execution failed") from exc
 
     last_message = result["messages"][-1]
@@ -725,9 +779,19 @@ def chat_stream(
                     "model": response_model,
                 }
             )
-        except Exception:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming chat failed for thread_id=%s", req.thread_id)
-            yield _sse({"type": "error", "detail": "Agent execution failed"})
+            if _is_rate_limit_error(exc):
+                yield _sse(
+                    {
+                        "type": "error",
+                        "detail": "Rate limit exceeded",
+                        "error_type": "rate_limited",
+                        "retry_after": _rate_limit_retry_after(exc),
+                    }
+                )
+            else:
+                yield _sse({"type": "error", "detail": "Agent execution failed"})
 
     return StreamingResponse(
         generate(),
