@@ -1,15 +1,36 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, type KeyboardEvent } from 'react'
 import { useNavigate, useLocation } from '@tanstack/react-router'
-import { Send, Plus, Trash2, LogOut, Menu, GitBranch, X, ChevronRight, ChevronDown, Cloud } from 'lucide-react'
+import {
+  Send,
+  Plus,
+  Trash2,
+  LogOut,
+  Menu,
+  MessageSquare,
+  X,
+  ChevronDown,
+  ChevronRight,
+  Loader2,
+  Sparkles,
+  Copy,
+  Check,
+} from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeRaw from 'rehype-raw'
-import { getSessions, createSession, streamChat, getChatHistory, deleteSession, logout } from '../lib/api'
+import {
+  getSessions,
+  createSession,
+  streamChat,
+  getChatHistory,
+  deleteSession,
+  logout,
+} from '../lib/api'
 import type { Session, AgentStep } from '../types'
 import { ThemeToggle } from '../components/ThemeToggle'
 import { IconButton } from '../components/ui/IconButton'
-import { AccentButton } from '../components/ui/AccentButton'
-import { BrandIcon } from '../components/ui/BrandIcon'
+import { BrandLogo } from '../components/ui/BrandIcon'
+import { suggestions } from '../lib/suggestions'
 
 const PENDING_PREFIX = 'pending-'
 
@@ -23,7 +44,15 @@ function normalizeRole(role: string): 'user' | 'assistant' {
   return 'user'
 }
 
-type ChatMessage = { role: 'user' | 'assistant'; content: string; steps?: AgentStep[]; tokens?: number; tps?: number; timestamp?: number; model?: string }
+type ChatMessage = {
+  role: 'user' | 'assistant'
+  content: string
+  steps?: AgentStep[]
+  tokens?: number
+  tps?: number
+  timestamp?: number
+  model?: string
+}
 
 function normalizeChatMessage(raw: Partial<ChatMessage> & { role: string }): ChatMessage {
   return {
@@ -37,66 +66,64 @@ function normalizeChatMessage(raw: Partial<ChatMessage> & { role: string }): Cha
   }
 }
 
-function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
-  const [open, setOpen] = useState(false)
-  useEffect(() => {
-    if (isLatest) {
-      setOpen(true)
+function getThreadIdFromSearch(search?: string): string | undefined {
+  if (!search) return undefined
+  const params = new URLSearchParams(search)
+  return params.get('threadId') || undefined
+}
+
+function getQueryFromSearch(search?: string): string {
+  if (!search) return ''
+  const params = new URLSearchParams(search)
+  return params.get('q') ?? ''
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* noop */
     }
-  }, [isLatest])
+  }
   return (
-    <div className="text-xs text-(--text-tertiary)">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        className="flex items-center gap-1 hover:text-(--text-secondary) transition-colors cursor-pointer"
-      >
-        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        {open ? 'Hide reasoning' : 'See reasoning'}
-      </button>
-      {open && (
-        <div className="mt-1 ml-4 px-4 py-2 bg-(--bg-secondary) text-(--text-secondary)">
-          <div className="markdown-body text-sm">
-            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
-              {text}
-            </ReactMarkdown>
-          </div>
-          {live && <span className="animate-pulse">▍</span>}
-        </div>
-      )}
-    </div>
+    <button
+      onClick={handleCopy}
+      className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs text-[var(--text-tertiary)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] transition-colors"
+      title="Copy message"
+    >
+      {copied ? <Check className="h-3 w-3" /> : <Copy className="h-3 w-3" />}
+      {copied ? 'Copied' : 'Copy'}
+    </button>
   )
 }
 
-function StepTrace({ steps, live }: { steps?: AgentStep[]; live?: boolean }) {
-  if (!steps || steps.length === 0) return null
-  let lastReasoningIdx = -1
-  steps.forEach((s, i) => {
-    if (s.type === 'reasoning') lastReasoningIdx = i
-  })
-  const toolResultIds = new Set(
-    steps.filter((s) => s.type === 'tool_result').map((s) => (s as { tool_call_id?: string }).tool_call_id),
-  )
+function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
+  const [open, setOpen] = useState(false)
+  useEffect(() => {
+    if (isLatest) setOpen(true)
+  }, [isLatest])
   return (
-    <div className="space-y-1.5 px-1">
-      {steps.map((s, i) => {
-        const nextStep = steps[i + 1]
-        const isLastReasoningBeforeTools = s.type === 'reasoning' && i === lastReasoningIdx && nextStep?.type === 'tool_call'
-        const showPuttingTogether = isLastReasoningBeforeTools
-        return (
-          <>
-            {s.type === 'reasoning' && <ReasoningChip key={`reasoning-${i}`} text={s.text} live={live && i === lastReasoningIdx} isLatest={i === lastReasoningIdx} />}
-            {showPuttingTogether && (
-              <div key={`putting-${i}`} className="flex items-start gap-1.5 text-xs text-(--text-tertiary)">
-                <Cloud className="w-3 h-3 shrink-0 mt-0.5" />
-                <span className="italic">Putting it all together{live && <span className="thinking-dots"></span>}</span>
-              </div>
-            )}
-            {s.type === 'tool_call' && <ToolCallItem key={`tool-${i}`} step={s} processing={live && !toolResultIds.has((s as { tool_call_id?: string }).tool_call_id)} />}
-            {s.type === 'tool_result' && <ToolResultItem key={`result-${i}`} step={s} />}
-          </>
-        )
-      })}
+    <div className="mt-2 text-xs">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="inline-flex items-center gap-1 text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
+      >
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        {open ? 'Hide reasoning' : 'See reasoning'}
+      </button>
+      {open && (
+        <div className="mt-1.5 px-3 py-2 rounded-lg bg-[var(--bg-subtle)] border border-[var(--border-subtle)] text-[var(--text-secondary)] leading-relaxed">
+          <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeRaw]}>
+            {text}
+          </ReactMarkdown>
+          {live && <span className="streaming-cursor" />}
+        </div>
+      )}
     </div>
   )
 }
@@ -106,18 +133,18 @@ function ToolCallItem({ step, processing }: { step: AgentStep; processing?: bool
   if (step.type !== 'tool_call') return null
   const argsStr = step.args && Object.keys(step.args).length > 0 ? JSON.stringify(step.args, null, 2) : '{}'
   return (
-    <div className="text-xs text-(--text-tertiary)">
+    <div className="text-xs">
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1 hover:text-(--text-secondary) transition-colors cursor-pointer"
+        className="inline-flex items-center gap-1.5 text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
       >
-        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        <span className="truncate">{step.name}</span>
-        {processing && <span className="thinking-dots"></span>}
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        <span className="font-mono">{step.name}</span>
+        {processing && <span className="typing-dots text-[var(--text-tertiary)]"><span /><span /><span /></span>}
       </button>
       {open && (
-        <pre className="mt-1 ml-4 text-(--text-secondary) whitespace-pre-wrap break-words bg-(--bg-tertiary) px-2 py-1.5 rounded border border-(--border-secondary)">
+        <pre className="mt-1.5 ml-4 px-3 py-2 rounded-lg bg-[var(--bg-subtle)] border border-[var(--border-subtle)] text-[var(--text-secondary)] whitespace-pre-wrap break-words text-[11px] leading-relaxed overflow-x-auto">
           {argsStr}
         </pre>
       )}
@@ -150,17 +177,17 @@ function ToolResultItem({ step }: { step: AgentStep }) {
   }
   const formatted = formatResult(step.result)
   return (
-    <div className="text-xs text-(--text-tertiary)">
+    <div className="text-xs">
       <button
         type="button"
         onClick={() => setOpen(!open)}
-        className="flex items-center gap-1 hover:text-(--text-secondary) transition-colors cursor-pointer"
+        className="inline-flex items-center gap-1.5 text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors"
       >
-        {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-        <span className="truncate">{step.name} result</span>
+        {open ? <ChevronDown className="h-3 w-3" /> : <ChevronRight className="h-3 w-3" />}
+        <span className="font-mono">{step.name} result</span>
       </button>
       {open && (
-        <pre className="mt-1 ml-4 text-(--text-secondary) whitespace-pre-wrap break-words bg-(--bg-tertiary) px-2 py-1.5 rounded border border-(--border-secondary)">
+        <pre className="mt-1.5 ml-4 px-3 py-2 rounded-lg bg-[var(--bg-subtle)] border border-[var(--border-subtle)] text-[var(--text-secondary)] whitespace-pre-wrap break-words text-[11px] leading-relaxed overflow-x-auto max-h-72">
           {formatted}
         </pre>
       )}
@@ -168,22 +195,47 @@ function ToolResultItem({ step }: { step: AgentStep }) {
   )
 }
 
+function StepTrace({ steps, live }: { steps?: AgentStep[]; live?: boolean }) {
+  if (!steps || steps.length === 0) return null
+  let lastReasoningIdx = -1
+  steps.forEach((s, i) => {
+    if (s.type === 'reasoning') lastReasoningIdx = i
+  })
+  const toolResultIds = new Set(
+    steps.filter((s) => s.type === 'tool_result').map((s) => (s as { tool_call_id?: string }).tool_call_id),
+  )
+  return (
+    <div className="mt-2 space-y-1.5">
+      {steps.map((s, i) => (
+        <div key={i}>
+          {s.type === 'reasoning' && (
+            <ReasoningChip text={s.text} live={live && i === lastReasoningIdx} isLatest={i === lastReasoningIdx} />
+          )}
+          {s.type === 'tool_call' && (
+            <ToolCallItem
+              step={s}
+              processing={live && !toolResultIds.has((s as { tool_call_id?: string }).tool_call_id)}
+            />
+          )}
+          {s.type === 'tool_result' && <ToolResultItem step={s} />}
+        </div>
+      ))}
+    </div>
+  )
+}
+
 function MarkdownContent({ content }: { content: string }) {
   return (
-    <div className="markdown-body text-sm">
+    <div className="markdown-body">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw]}
         components={{
-          table: ({ node, ...props }) => (
-            <table className="w-full border-collapse my-2 text-xs" {...props} />
+          table: ({ node: _node, ...props }) => <table className="w-full border-collapse my-2" {...props} />,
+          th: ({ node: _node, ...props }) => (
+            <th className="border border-[var(--border-subtle)] px-2 py-1 text-left font-medium" {...props} />
           ),
-          th: ({ node, ...props }) => (
-            <th className="border border-(--border-secondary) px-2 py-1 text-left font-medium text-(--text-secondary)" {...props} />
-          ),
-          td: ({ node, ...props }) => (
-            <td className="border border-(--border-secondary) px-2 py-1 align-top text-(--text-secondary)" {...props} />
-          ),
+          td: ({ node: _node, ...props }) => <td className="border border-[var(--border-subtle)] px-2 py-1 align-top" {...props} />,
         }}
       >
         {content}
@@ -192,61 +244,185 @@ function MarkdownContent({ content }: { content: string }) {
   )
 }
 
-function getThreadIdFromSearch(search?: string): string | undefined {
-  if (!search) return undefined
-  const params = new URLSearchParams(search)
-  return params.get('threadId') || undefined
+function EmptyState({ onPick }: { onPick: (prompt: string) => void }) {
+  return (
+    <div className="max-w-2xl mx-auto px-4 sm:px-6 py-16 sm:py-24 text-center slide-up">
+      <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-[var(--accent)] text-white mb-5 shadow-[var(--shadow-sm)]">
+        <Sparkles className="h-6 w-6" strokeWidth={2.25} />
+      </div>
+      <h2 className="text-2xl sm:text-3xl font-semibold tracking-tight text-[var(--text-primary)] mb-2">
+        How can I help you ship today?
+      </h2>
+      <p className="text-sm sm:text-base text-[var(--text-secondary)] mb-8 max-w-md mx-auto">
+        Ask anything about your orders, warehouses, or rates — the agent will pull live data from your Bigship account.
+      </p>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-left">
+        {suggestions.map((s) => {
+          const Icon = s.icon
+          return (
+            <button
+              key={s.title}
+              onClick={() => onPick(s.prompt)}
+              className="group flex items-start gap-3 p-3.5 rounded-xl border border-[var(--border-subtle)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-subtle)] hover:border-[var(--border-default)] transition-all hover:-translate-y-0.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-base)]"
+            >
+              <Icon className="h-4 w-4 mt-0.5 text-[var(--text-tertiary)] group-hover:text-[var(--accent)] transition-colors" />
+              <div>
+                <div className="text-sm font-medium text-[var(--text-primary)]">{s.title}</div>
+                <div className="text-xs text-[var(--text-tertiary)] mt-0.5 line-clamp-2">{s.prompt}</div>
+              </div>
+            </button>
+          )
+        })}
+      </div>
+    </div>
+  )
 }
 
-function MobileSidebarContent({ onClose, sessions, activeThreadId, handleNewSession, handleSessionClick, handleDeleteSession }: {
-  onClose: () => void
+function MessageBubble({ msg, isLatest, streaming }: {
+  msg: ChatMessage
+  isLatest: boolean
+  streaming: boolean
+}) {
+  const isUser = msg.role === 'user'
+  if (isUser) {
+    return (
+      <div className="flex justify-end fade-in">
+        <div className="max-w-[85%] sm:max-w-[75%] px-4 py-2.5 rounded-2xl bg-[var(--accent)] text-white text-[0.9375rem] leading-relaxed whitespace-pre-wrap break-words">
+          {msg.content}
+        </div>
+      </div>
+    )
+  }
+  const showCursor = streaming && isLatest
+  return (
+    <div className="flex justify-start fade-in">
+      <div className="max-w-[85%] sm:max-w-[75%] min-w-0">
+        <StepTrace steps={msg.steps} live={streaming && isLatest} />
+        {msg.content && (
+          <>
+            <div className="px-4 py-3 rounded-2xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[0.9375rem] text-[var(--text-primary)]">
+              <MarkdownContent content={msg.content} />
+              {showCursor && !msg.content.endsWith(' ') && <span className="streaming-cursor" />}
+            </div>
+            {!streaming && msg.content && (
+              <div className="mt-1.5 flex items-center gap-2">
+                <CopyButton text={msg.content} />
+                {msg.model && (
+                  <span className="text-[10px] text-[var(--text-quaternary)] font-mono">
+                    {msg.model.replace(/:free$/, '')}
+                  </span>
+                )}
+                {msg.tokens != null && msg.tps != null && (
+                  <span className="text-[10px] text-[var(--text-quaternary)]">
+                    {msg.tokens} tokens · {msg.tps} TPS
+                  </span>
+                )}
+              </div>
+            )}
+          </>
+        )}
+        {!msg.content && streaming && isLatest && (
+          <div className="px-4 py-3 rounded-2xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--text-tertiary)] text-sm">
+            <span className="typing-dots"><span /><span /><span /></span>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+function SidebarContent({
+  onClose,
+  sessions,
+  activeThreadId,
+  handleNewSession,
+  handleSessionClick,
+  handleDeleteSession,
+  userName,
+  handleLogout,
+}: {
+  onClose?: () => void
   sessions: Session[]
   activeThreadId: string | null
   handleNewSession: () => void
   handleSessionClick: (id: string) => void
   handleDeleteSession: (id: string) => void
+  userName: string
+  handleLogout: () => void
 }) {
   return (
-    <>
-      <div className="p-3 border-b border-(--border-primary) flex items-center justify-between">
-        <AccentButton size="sm" onClick={handleNewSession} className="w-full">
-          <Plus className="w-3 h-3" />
-          New Chat
-        </AccentButton>
-        <IconButton onClick={onClose} ariaLabel="Close history" className="ml-2">
-          <X className="w-4 h-4" />
-        </IconButton>
+    <div className="flex flex-col h-full">
+      <div className="px-3 pt-3 pb-2 flex items-center justify-between">
+        <BrandLogo size="sm" />
+        {onClose && (
+          <IconButton onClick={onClose} ariaLabel="Close sidebar" size="sm">
+            <X className="h-4 w-4" />
+          </IconButton>
+        )}
       </div>
-      <div className="flex-1 overflow-y-auto">
-        <div className="p-2 space-y-1">
-          {sessions.map((session) => (
-            <div
-              key={session.thread_id}
-              className={`group flex items-center justify-between px-3 py-2 text-sm rounded cursor-pointer ${
-                activeThreadId === session.thread_id
-                  ? 'bg-(--accent)/10 text-(--accent)'
-                  : 'text-(--text-secondary) hover:bg-(--bg-tertiary)'
-              }`}
-              onClick={() => handleSessionClick(session.thread_id)}
-            >
-              <span className="truncate flex-1">
-                {session.label || 'Chat'}
-              </span>
-              <button
-                onClick={(e) => {
-                  e.stopPropagation()
-                  handleDeleteSession(session.thread_id)
-                }}
-                className="ml-2 opacity-0 group-hover:opacity-100 text-(--text-tertiary) hover:text-red-500 transition-opacity"
-                title="Delete chat"
+      <div className="px-3 pb-3">
+        <button
+          onClick={handleNewSession}
+          className="w-full inline-flex items-center justify-center gap-2 px-3 py-2 rounded-lg border border-[var(--border-default)] bg-[var(--bg-elevated)] text-sm font-medium text-[var(--text-primary)] hover:bg-[var(--bg-subtle)] transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-base)]"
+        >
+          <Plus className="h-4 w-4" />
+          New chat
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-2 pb-2">
+        <div className="px-2 pt-1 pb-1.5 text-[10px] font-medium uppercase tracking-wider text-[var(--text-tertiary)]">
+          Recent
+        </div>
+        <div className="space-y-0.5">
+          {sessions.length === 0 && (
+            <p className="px-2 py-3 text-xs text-[var(--text-tertiary)] text-center">
+              No conversations yet
+            </p>
+          )}
+          {sessions.map((session) => {
+            const active = activeThreadId === session.thread_id
+            return (
+              <div
+                key={session.thread_id}
+                className={`group flex items-center gap-1 pl-2 pr-1 py-1.5 text-sm rounded-lg cursor-pointer transition-colors ${
+                  active
+                    ? 'bg-[var(--accent-soft)] text-[var(--text-primary)]'
+                    : 'text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)]'
+                }`}
+                onClick={() => handleSessionClick(session.thread_id)}
               >
-                <Trash2 className="w-3 h-3" />
-              </button>
-            </div>
-          ))}
+                <MessageSquare className="h-3.5 w-3.5 shrink-0 opacity-60" />
+                <span className="truncate flex-1 text-[13px]">{session.label || 'Chat'}</span>
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    handleDeleteSession(session.thread_id)
+                  }}
+                  className="opacity-0 group-hover:opacity-100 text-[var(--text-tertiary)] hover:text-[var(--danger)] transition-all p-1 rounded"
+                  title="Delete chat"
+                  aria-label="Delete chat"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </div>
+            )
+          })}
         </div>
       </div>
-    </>
+      <div className="border-t border-[var(--border-subtle)] p-3">
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2 min-w-0">
+            <div className="w-7 h-7 rounded-full bg-[var(--accent)] text-white flex items-center justify-center text-xs font-medium shrink-0">
+              {userName.charAt(0).toUpperCase()}
+            </div>
+            <span className="text-sm text-[var(--text-primary)] truncate">{userName}</span>
+          </div>
+          <IconButton onClick={handleLogout} ariaLabel="Log out" variant="destructive" size="sm">
+            <LogOut className="h-4 w-4" />
+          </IconButton>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -254,25 +430,29 @@ export default function ChatPage() {
   const navigate = useNavigate()
   const location = useLocation()
   const urlThreadId = getThreadIdFromSearch(location.search)
+  const urlPrompt = getQueryFromSearch(location.search)
+
   const [sessions, setSessions] = useState<Session[]>([])
   const [activeThreadId, setActiveThreadId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
   const [streamingActive, setStreamingActive] = useState(false)
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
-  const [showMobileSidebar, setShowMobileSidebar] = useState(false)
+  const [sidebarOpen, setSidebarOpen] = useState(true)
+  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const prevThreadIdRef = useRef<string | null>(null)
+  const promptConsumedRef = useRef(false)
+  const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   const userName = localStorage.getItem('user_name') || 'User'
 
   useEffect(() => {
-    const mq = window.matchMedia('(max-width: 768px)')
-    setSidebarCollapsed(mq.matches)
-    const handler = (e: MediaQueryListEvent) => setSidebarCollapsed(e.matches)
-    mq.addEventListener('change', handler)
-    return () => mq.removeEventListener('change', handler)
+    const mq = window.matchMedia('(min-width: 768px)')
+    const update = () => setSidebarOpen(mq.matches)
+    update()
+    mq.addEventListener('change', update)
+    return () => mq.removeEventListener('change', update)
   }, [])
 
   useEffect(() => {
@@ -287,7 +467,10 @@ export default function ChatPage() {
       }
       setSessions((prev) => {
         if (prev.some((s) => s.thread_id === urlThreadId)) return prev
-        return [...prev, { id: '', thread_id: urlThreadId, label: 'Chat', created_at: '', last_used_at: '' }]
+        return [
+            ...prev,
+            { id: '', thread_id: urlThreadId, label: 'Chat', created_at: '', last_used_at: '' },
+          ]
       })
     }
   }, [urlThreadId])
@@ -304,13 +487,11 @@ export default function ChatPage() {
         const data = await getChatHistory(activeThreadId)
         if (!cancelled) {
           setMessages(
-            (data.messages || []).map((m: ChatMessage) => normalizeChatMessage(m))
+            (data.messages || []).map((m: ChatMessage) => normalizeChatMessage(m)),
           )
         }
       } catch {
-        if (!cancelled) {
-          setMessages([])
-        }
+        if (!cancelled) setMessages([])
       }
     }
     loadHistory()
@@ -323,11 +504,28 @@ export default function ChatPage() {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
 
+  useEffect(() => {
+    if (urlPrompt && !promptConsumedRef.current && activeThreadId) {
+      promptConsumedRef.current = true
+      setInput(urlPrompt)
+      // strip the q param so a refresh doesn't re-populate
+      navigate({ to: '/chat', search: { threadId: activeThreadId }, replace: true })
+      // auto-send once thread is ready
+      setTimeout(() => {
+        const ta = textareaRef.current
+        if (ta) ta.focus()
+      }, 0)
+    }
+  }, [urlPrompt, activeThreadId])
+
   const loadSessions = async () => {
     try {
       const data = await getSessions()
       setSessions(data.sessions)
-      const effectiveThreadId = urlThreadId || activeThreadId || (data.sessions.length > 0 ? data.sessions[0].thread_id : null)
+      const effectiveThreadId =
+        urlThreadId ||
+        activeThreadId ||
+        (data.sessions.length > 0 ? data.sessions[0].thread_id : null)
       if (effectiveThreadId && effectiveThreadId !== activeThreadId) {
         setActiveThreadId(effectiveThreadId)
         if (effectiveThreadId !== urlThreadId) {
@@ -335,7 +533,7 @@ export default function ChatPage() {
         }
       }
     } catch {
-      // ignore
+      /* ignore */
     }
   }
 
@@ -343,13 +541,19 @@ export default function ChatPage() {
     const pendingId = `${PENDING_PREFIX}${Date.now()}`
     setActiveThreadId(pendingId)
     setMessages([])
-    setSessions((prev) => [...prev, { id: '', thread_id: pendingId, label: 'New Chat', created_at: '', last_used_at: '' }])
+    promptConsumedRef.current = false
+    setSessions((prev) => [
+      ...prev,
+      { id: '', thread_id: pendingId, label: 'New chat', created_at: '', last_used_at: '' },
+    ])
     navigate({ to: '/chat', search: { threadId: pendingId } })
+    setMobileSidebarOpen(false)
   }
 
   const handleSessionClick = async (threadId: string) => {
     setActiveThreadId(threadId)
     setMessages([])
+    promptConsumedRef.current = true
     try {
       const data = await getChatHistory(threadId)
       setMessages(
@@ -357,12 +561,13 @@ export default function ChatPage() {
           role: normalizeRole(m.role),
           content: m.content,
           steps: m.steps,
-        }))
+        })),
       )
     } catch {
       setMessages([])
     }
     navigate({ to: '/chat', search: { threadId } })
+    setMobileSidebarOpen(false)
   }
 
   const handleDeleteSession = async (threadId: string) => {
@@ -380,7 +585,7 @@ export default function ChatPage() {
         }
       }
     } catch {
-      // ignore
+      /* ignore */
     }
   }
 
@@ -388,18 +593,21 @@ export default function ChatPage() {
     if (!activeThreadId) return null
     if (!isPending(activeThreadId)) return activeThreadId
     try {
-      const data = await createSession('New Chat')
+      const data = await createSession('New chat')
       const threadId = data.thread_id
       setActiveThreadId(threadId)
       setSessions((prev) =>
         prev.map((s) =>
-          s.thread_id === activeThreadId ? { ...s, thread_id: threadId, label: 'New Chat' } : s,
+          s.thread_id === activeThreadId ? { ...s, thread_id: threadId, label: 'New chat' } : s,
         ),
       )
       navigate({ to: '/chat', search: { threadId } })
       return threadId
     } catch {
-      setMessages((prev) => [...prev, { role: 'assistant', content: 'Error: failed to start chat' }])
+      setMessages((prev) => [
+        ...prev,
+        { role: 'assistant', content: 'Error: failed to start chat' },
+      ])
       return null
     }
   }
@@ -409,16 +617,20 @@ export default function ChatPage() {
     const userMessage = input.trim()
     const userTimestamp = Date.now()
     setInput('')
-    setMessages((prev) => [...prev, { role: 'user', content: userMessage, timestamp: userTimestamp }, { role: 'assistant', content: '', steps: [] }])
+    promptConsumedRef.current = true
+    if (textareaRef.current) textareaRef.current.style.height = 'auto'
+    setMessages((prev) => [
+      ...prev,
+      { role: 'user', content: userMessage, timestamp: userTimestamp },
+      { role: 'assistant', content: '', steps: [] },
+    ])
     setLoading(true)
     setStreamingActive(true)
     try {
       const threadId = await ensureThreadId()
       if (!threadId) return
       await streamChat(threadId, userMessage, (ev) => {
-        if (ev.type === 'done' || ev.type === 'error') {
-          setStreamingActive(false)
-        }
+        if (ev.type === 'done' || ev.type === 'error') setStreamingActive(false)
         setMessages((prev) => {
           if (prev.length === 0) return prev
           const idx = prev.length - 1
@@ -454,24 +666,45 @@ export default function ChatPage() {
             const next = [...prev]
             next[idx] = {
               ...last,
-              steps: [...(last.steps ?? []), { type: 'tool_call', name: ev.name, args: ev.args, tool_call_id: ev.tool_call_id }],
+              steps: [
+                ...(last.steps ?? []),
+                { type: 'tool_call', name: ev.name, args: ev.args, tool_call_id: ev.tool_call_id },
+              ],
             }
             return next
           }
           if (ev.type === 'tool_result') {
             const next = [...prev]
             const steps = next[idx].steps ?? []
-            const matchIdx = steps.map((s) => (s.type === 'tool_call' ? s.tool_call_id : '')).lastIndexOf(ev.tool_call_id)
-             if (matchIdx >= 0) {
+            const matchIdx = steps
+              .map((s) => (s.type === 'tool_call' ? s.tool_call_id : ''))
+              .lastIndexOf(ev.tool_call_id)
+            if (matchIdx >= 0) {
               steps[matchIdx] = { ...steps[matchIdx], result: ev.result } as AgentStep
             } else {
-              steps.push({ type: 'tool_result', tool_call_id: ev.tool_call_id, name: ev.name, result: ev.result })
+              steps.push({
+                type: 'tool_result',
+                tool_call_id: ev.tool_call_id,
+                name: ev.name,
+                result: ev.result,
+              })
             }
             next[idx] = { ...last, steps }
             return next
           }
           if (ev.type === 'done') {
-            return [...prev.slice(0, idx), normalizeChatMessage({ role: 'assistant', content: ev.response, steps: ev.steps ?? [], tokens: ev.tokens, tps: ev.tps, timestamp: Date.now(), model: ev.model })]
+            return [
+              ...prev.slice(0, idx),
+              normalizeChatMessage({
+                role: 'assistant',
+                content: ev.response,
+                steps: ev.steps ?? [],
+                tokens: ev.tokens,
+                tps: ev.tps,
+                timestamp: Date.now(),
+                model: ev.model,
+              }),
+            ]
           }
           if (ev.type === 'error') {
             const next = [...prev]
@@ -479,7 +712,10 @@ export default function ChatPage() {
               ev.error_type === 'rate_limited'
                 ? `Rate limit reached. Please try again${ev.retry_after ? ` in ~${ev.retry_after}s` : ' in a few seconds'}.`
                 : null
-            next[idx] = { ...last, content: last.content || rateLimitMessage || 'Error: failed to send message' }
+            next[idx] = {
+              ...last,
+              content: last.content || rateLimitMessage || 'Error: failed to send message',
+            }
             return next
           }
           return prev
@@ -510,215 +746,192 @@ export default function ChatPage() {
     }
   }
 
+  const autoResize = (el: HTMLTextAreaElement) => {
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 200)}px`
+  }
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      handleSend()
+    }
+  }
+
+  const pickSuggestion = (prompt: string) => {
+    if (!activeThreadId) {
+      handleNewSession()
+    }
+    setInput(prompt)
+    promptConsumedRef.current = true
+    setTimeout(() => textareaRef.current?.focus(), 0)
+  }
+
   return (
-    <div className="min-h-screen bg-(--bg-primary) text-(--text-secondary) font-sans antialiased">
-      {/* Header */}
-      <header className="border-b border-(--border-primary) bg-(--bg-primary)" style={{ height: 'calc(3rem + env(safe-area-inset-top))' }}>
-        <div className="h-12 px-4 flex items-center justify-between" style={{ paddingTop: 'env(safe-area-inset-top)' }}>
-          <div className="flex items-center gap-3">
-            <IconButton
-              onClick={() => {
-                if (window.matchMedia('(max-width: 768px)').matches) {
-                  setShowMobileSidebar(true)
-                } else {
-                  setSidebarCollapsed(!sidebarCollapsed)
-                }
-              }}
-              ariaLabel={sidebarCollapsed ? 'Show history' : 'Hide history'}
-            >
-              <Menu className="w-5 h-5" />
-            </IconButton>
-            <div className="flex items-center gap-2">
-              <BrandIcon size="sm" />
-              <span className="text-xs font-semibold tracking-wide text-(--text-primary)">BIGSHIP</span>
-            </div>
-          </div>
-          <div className="flex items-center gap-2">
-            <IconButton onClick={handleNewSession} ariaLabel="New chat">
-              <Plus className="w-5 h-5" />
-            </IconButton>
-            <ThemeToggle />
-            <div className="w-px h-5 bg-(--border-primary)" />
-            <span className="text-xs text-(--text-tertiary)">{userName}</span>
-            <IconButton onClick={handleLogout} ariaLabel="Log out" variant="destructive">
-              <LogOut className="w-5 h-5" />
-            </IconButton>
-          </div>
-        </div>
-      </header>
+    <div className="h-screen flex bg-[var(--bg-base)] text-[var(--text-primary)] overflow-hidden">
+      {/* Desktop sidebar */}
+      {sidebarOpen && (
+        <aside
+          className="hidden md:flex w-64 shrink-0 border-r border-[var(--border-subtle)] bg-[var(--bg-subtle)]/40 flex-col"
+          style={{ paddingTop: 'env(safe-area-inset-top)' }}
+        >
+          <SidebarContent
+            sessions={sessions}
+            activeThreadId={activeThreadId}
+            handleNewSession={handleNewSession}
+            handleSessionClick={handleSessionClick}
+            handleDeleteSession={handleDeleteSession}
+            userName={userName}
+            handleLogout={handleLogout}
+          />
+        </aside>
+      )}
 
       {/* Mobile sidebar overlay */}
-      {showMobileSidebar && (
-        <>
+      {mobileSidebarOpen && (
+        <div
+          className="fixed inset-0 z-40 md:hidden"
+          role="dialog"
+          aria-modal="true"
+        >
           <div
-            className="fixed inset-0 bg-black/50 z-40 md:hidden"
-            onClick={() => setShowMobileSidebar(false)}
+            className="absolute inset-0 bg-black/40 fade-in"
+            onClick={() => setMobileSidebarOpen(false)}
           />
-          <aside className="fixed inset-y-0 left-0 w-64 border-r border-(--border-primary) bg-(--bg-secondary) flex flex-col z-50 md:hidden">
-            <MobileSidebarContent
-              onClose={() => setShowMobileSidebar(false)}
+          <aside
+            className="absolute inset-y-0 left-0 w-72 bg-[var(--bg-base)] border-r border-[var(--border-subtle)] slide-up"
+            style={{ paddingTop: 'env(safe-area-inset-top)' }}
+          >
+            <SidebarContent
+              onClose={() => setMobileSidebarOpen(false)}
               sessions={sessions}
               activeThreadId={activeThreadId}
               handleNewSession={handleNewSession}
               handleSessionClick={handleSessionClick}
               handleDeleteSession={handleDeleteSession}
+              userName={userName}
+              handleLogout={handleLogout}
             />
           </aside>
-        </>
+        </div>
       )}
 
-      {/* Main layout */}
-      <div className="flex h-[calc(100vh-3rem)] overflow-hidden">
-        {/* Chat History Sidebar (desktop) */}
-        {!sidebarCollapsed && (
-          <aside className="hidden w-64 border-r border-(--border-primary) bg-(--bg-secondary) flex-col md:flex">
-            <div className="p-3 border-b border-(--border-primary)">
-              <AccentButton size="sm" onClick={handleNewSession} className="w-full">
-                <Plus className="w-3 h-3" />
-                New Chat
-              </AccentButton>
-            </div>
-            <div className="flex-1 overflow-y-auto">
-              <div className="p-2 space-y-1">
-                {sessions.map((session) => (
-                  <div
-                    key={session.thread_id}
-                    className={`group flex items-center justify-between px-3 py-2 text-sm rounded cursor-pointer ${
-                      activeThreadId === session.thread_id
-                        ? 'bg-(--accent)/10 text-(--accent)'
-                        : 'text-(--text-secondary) hover:bg-(--bg-tertiary)'
-                    }`}
-                    onClick={() => handleSessionClick(session.thread_id)}
-                  >
-                    <span className="truncate flex-1">
-                      {session.label || 'Chat'}
-                    </span>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation()
-                        handleDeleteSession(session.thread_id)
-                      }}
-                      className="ml-2 opacity-0 group-hover:opacity-100 text-(--text-tertiary) hover:text-red-500 transition-opacity"
-                      title="Delete chat"
-                    >
-                      <Trash2 className="w-3 h-3" />
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </aside>
-        )}
-
-        {/* Main Chat Area */}
-        <main className="flex-1 flex flex-col overflow-hidden">
-          <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-6 space-y-6" style={{ paddingBottom: 'calc(4rem + env(safe-area-inset-bottom))' }}>
-            {messages.length === 0 ? (
-              <div className="h-full flex items-center justify-center text-center">
-                <div>
-                  <GitBranch className="w-8 h-8 text-(--accent)/30 mx-auto mb-3" />
-                  <p className="text-sm text-(--text-tertiary) mb-2">Start a new conversation</p>
-                  <p className="text-xs text-(--text-tertiary)">
-                    Type a message below to begin.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              messages.map((msg, idx) => (
-                <div
-                  key={idx}
-                  className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
-                >
-                  {msg.role === 'user' ? (
-                    <div className="max-w-[80%] sm:max-w-[70%]">
-                      <p className="text-[10px] font-semibold tracking-wider text-(--accent) mb-1 text-right uppercase">You</p>
-                      <div className="px-4 py-2 bg-(--accent) text-(--bg-primary)">
-                        <p className="text-sm whitespace-pre-wrap break-words">{msg.content}</p>
-                      </div>
-                      {msg.timestamp && (
-                        <p className="text-[10px] text-(--text-tertiary) mt-1 text-right">
-                          {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                        </p>
-                      )}
-                    </div>
-                    ) : (
-                      <div className="max-w-[80%] sm:max-w-[70%] space-y-2 min-w-0">
-                        <p className="text-[10px] font-semibold tracking-wider text-orange-400 mb-1 uppercase">Bigship Agent</p>
-                        <StepTrace steps={msg.steps} live={streamingActive && idx === messages.length - 1} />
-                        {msg.content && (
-                          <div className="px-4 py-2 bg-(--bg-secondary) text-(--text-secondary)">
-                            <MarkdownContent content={msg.content} />
-                          </div>
-                        )}
-                        {msg.tokens != null && msg.tps != null && (
-                          <p className="text-[10px] text-(--text-tertiary)">
-                            {msg.tokens} tokens · {msg.tps} TPS
-                          </p>
-                        )}
-                        {msg.model && (
-                          <p className="text-[10px] text-(--text-tertiary)">
-                            {msg.model.replace(/:free$/, '')}
-                          </p>
-                        )}
-                        {msg.timestamp && (
-                          <p className="text-[10px] text-(--text-tertiary)">
-                            {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                          </p>
-                        )}
-                      </div>
-                    )}
-                </div>
-              ))
-            )}
-            {(() => {
-              const last = messages[messages.length - 1]
-              const showThinking =
-                loading && (!last || last.role !== 'assistant' || (!last.content && !(last.steps && last.steps.length > 0)))
-              return showThinking ? (
-                <div className="flex justify-start">
-                  <div className="px-4 py-2 bg-(--bg-secondary) text-(--text-tertiary)">
-                    <span className="text-xs">Thinking<span className="thinking-dots"></span></span>
-                  </div>
-                </div>
-              ) : null
-            })()}
-            <div ref={messagesEndRef} />
+      {/* Main */}
+      <main className="flex-1 flex flex-col min-w-0">
+        {/* Top header */}
+        <header
+          className="h-14 shrink-0 border-b border-[var(--border-subtle)] bg-[var(--bg-base)]/85 backdrop-blur-md flex items-center justify-between px-3 sm:px-5"
+          style={{ paddingTop: 'env(safe-area-inset-top)' }}
+        >
+          <div className="flex items-center gap-1.5">
+            <IconButton
+              onClick={() => {
+                if (window.matchMedia('(min-width: 768px)').matches) {
+                  setSidebarOpen(!sidebarOpen)
+                } else {
+                  setMobileSidebarOpen(true)
+                }
+              }}
+              ariaLabel={sidebarOpen ? 'Hide sidebar' : 'Show sidebar'}
+            >
+              <Menu className="h-4 w-4" />
+            </IconButton>
+            <span className="text-sm font-medium text-[var(--text-primary)] ml-1 truncate">
+              {messages.length > 0 ? 'Bigship Agent' : 'New chat'}
+            </span>
           </div>
+          <div className="flex items-center gap-1">
+            <IconButton
+              onClick={handleNewSession}
+              ariaLabel="New chat"
+              variant="subtle"
+            >
+              <Plus className="h-4 w-4" />
+            </IconButton>
+            <ThemeToggle />
+          </div>
+        </header>
 
-          {/* Input Area */}
-          {!activeThreadId && (
-            <div className="px-4 sm:px-6 py-3 border-t border-(--border-primary) bg-(--bg-secondary)">
-              <p className="text-xs text-(--text-tertiary) text-center">
-                No active conversation. Create a new chat to start.
-              </p>
+        {/* Messages area */}
+        <div
+          className="flex-1 overflow-y-auto"
+          style={{ paddingBottom: 'calc(7rem + env(safe-area-inset-bottom))' }}
+        >
+          {messages.length === 0 ? (
+            <EmptyState onPick={pickSuggestion} />
+          ) : (
+            <div className="max-w-3xl mx-auto px-4 sm:px-6 py-6 sm:py-10 space-y-5">
+              {messages.map((msg, idx) => (
+                <MessageBubble
+                  key={idx}
+                  msg={msg}
+                  isLatest={idx === messages.length - 1}
+                  streaming={streamingActive}
+                />
+              ))}
+              {loading &&
+                (() => {
+                  const last = messages[messages.length - 1]
+                  if (last && last.role === 'assistant' && last.content) return null
+                  if (last && last.role === 'assistant' && last.steps && last.steps.length > 0) return null
+                  return (
+                    <div className="flex justify-start fade-in">
+                      <div className="px-4 py-3 rounded-2xl bg-[var(--bg-elevated)] border border-[var(--border-subtle)] text-[var(--text-tertiary)] text-sm">
+                        <span className="typing-dots"><span /><span /><span /></span>
+                      </div>
+                    </div>
+                  )
+                })()}
+              <div ref={messagesEndRef} />
             </div>
           )}
-          <div
-            className="p-4 border-t border-(--border-primary) bg-(--bg-primary)"
-            style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}
-          >
-            <div className="max-w-4xl mx-auto flex gap-3">
-              <input
-                type="text"
-                value={input}
-                onChange={(e) => setInput(e.target.value)}
-                onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-                placeholder={activeThreadId ? 'Type a message...' : 'Create a new chat to start'}
-                className="flex-1 px-3 py-2.5 sm:py-2 text-base sm:text-sm bg-(--bg-secondary) border border-(--border-secondary) text-(--text-primary) placeholder-(--text-tertiary) focus:outline-none focus:border-(--accent) focus:ring-1 focus:ring-(--accent)/20 transition-colors disabled:opacity-50"
-                disabled={loading || !activeThreadId}
-              />
-              <button
-                onClick={handleSend}
-                disabled={loading || !input.trim() || !activeThreadId}
-                className="min-w-11 min-h-11 px-3 py-2 bg-(--accent) text-(--bg-primary) hover:bg-(--accent-hover) disabled:opacity-50 transition-colors flex items-center justify-center"
-                aria-label="Send message"
-              >
-                <Send className="w-5 h-5" />
-              </button>
+        </div>
+
+        {/* Floating composer */}
+        <div
+          className="absolute bottom-0 left-0 right-0 md:left-64"
+          style={{ paddingBottom: 'calc(1rem + env(safe-area-inset-bottom))' }}
+        >
+          <div className="max-w-3xl mx-auto px-3 sm:px-6">
+              {!activeThreadId ? (
+                <div className="text-center text-sm text-[var(--text-tertiary)] py-4">
+                  Start a new chat to begin
+                </div>
+              ) : (
+                <div className="composer-glow relative flex items-end gap-2 px-3 py-2 bg-[var(--bg-elevated)] border border-[var(--border-default)] rounded-2xl shadow-[var(--shadow-md)] transition-shadow">
+                  <textarea
+                    ref={textareaRef}
+                    value={input}
+                    onChange={(e) => {
+                      setInput(e.target.value)
+                      autoResize(e.target)
+                    }}
+                    onKeyDown={handleKeyDown}
+                    placeholder="Message Bigship Agent…"
+                    rows={1}
+                    className="flex-1 resize-none bg-transparent text-base sm:text-[0.9375rem] text-[var(--text-primary)] placeholder:text-[var(--text-quaternary)] focus:outline-none px-1 py-2 max-h-48 leading-relaxed"
+                    disabled={loading}
+                  />
+                  <button
+                    onClick={handleSend}
+                    disabled={loading || !input.trim()}
+                    className="shrink-0 inline-flex items-center justify-center w-8 h-8 rounded-lg bg-[var(--accent)] text-white hover:bg-[var(--accent-hover)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--bg-elevated)]"
+                    aria-label="Send message"
+                  >
+                    {loading ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Send className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+              )}
+              <p className="mt-2 text-[11px] text-center text-[var(--text-tertiary)]">
+                Bigship Agent can make mistakes. Verify order-critical data before acting.
+              </p>
             </div>
-          </div>
-        </main>
-      </div>
+        </div>
+      </main>
     </div>
   )
 }

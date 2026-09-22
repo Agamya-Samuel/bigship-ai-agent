@@ -5,7 +5,7 @@ import { router } from './routes/routeTree.gen'
 export default function App() {
   useEffect(() => {
     const theme = localStorage.getItem('theme') as 'dark' | 'light' | null
-    document.documentElement.setAttribute('data-theme', theme ?? 'dark')
+    document.documentElement.setAttribute('data-theme', theme ?? 'light')
   }, [])
 
   return <RouterProvider router={router} />

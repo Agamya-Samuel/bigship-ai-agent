@@ -4,24 +4,45 @@ interface IconButtonProps {
   children: ReactNode
   onClick?: () => void
   ariaLabel?: string
-  variant?: 'secondary' | 'destructive'
+  variant?: 'ghost' | 'subtle' | 'destructive'
+  size?: 'sm' | 'md'
+  disabled?: boolean
   className?: string
+  title?: string
 }
 
-export function IconButton({ children, onClick, ariaLabel, variant = 'secondary', className = '' }: IconButtonProps) {
-  const baseClasses = `p-2 min-w-11 min-h-11 border border-(--border-secondary) bg-(--bg-secondary) text-(--text-secondary) flex items-center justify-center transition-colors`
+export function IconButton({
+  children,
+  onClick,
+  ariaLabel,
+  variant = 'ghost',
+  size = 'md',
+  disabled = false,
+  className = '',
+  title,
+}: IconButtonProps) {
+  const sizeClasses = {
+    sm: 'w-8 h-8 [&_svg]:h-3.5 [&_svg]:w-3.5',
+    md: 'w-9 h-9 [&_svg]:h-4 [&_svg]:w-4',
+  }
 
   const variantClasses = {
-    secondary: 'hover:text-(--accent) hover:border-(--accent)/30',
-    destructive: 'hover:text-red-500 hover:border-red-500/30',
+    ghost:
+      'text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--text-primary)]',
+    subtle:
+      'bg-[var(--bg-subtle)] text-[var(--text-secondary)] hover:bg-[var(--border-subtle)] hover:text-[var(--text-primary)]',
+    destructive:
+      'text-[var(--text-secondary)] hover:bg-[var(--bg-subtle)] hover:text-[var(--danger)]',
   }
 
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       aria-label={ariaLabel}
-      className={`${baseClasses} ${variantClasses[variant]}` + (className ? ` ${className}` : '')}
+      title={title ?? ariaLabel}
+      className={`${sizeClasses[size]} ${variantClasses[variant]} rounded-lg flex items-center justify-center transition-colors disabled:opacity-50 disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-1 focus-visible:ring-offset-[var(--bg-base)] ${className}`}
     >
       {children}
     </button>

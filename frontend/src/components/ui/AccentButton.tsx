@@ -29,7 +29,7 @@ export function AccentButton({
       className={
         `${sizeClasses[size]} bg-(--accent) text-(--bg-primary) ` +
         `font-semibold uppercase tracking-widest hover:bg-(--accent-hover) ` +
-        `transition-colors flex items-center justify-center gap-2 min-h-11` +
+        `transition-colors flex items-center justify-center gap-2 min-h-11 rounded-md` +
         (className ? ` ${className}` : '')
       }
     >
