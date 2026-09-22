@@ -42,6 +42,30 @@ logger = logging.getLogger(__name__)
 
 DOCUMENT_TYPES = ["invoice", "label", "ewaybill", "manifest"]
 
+# User-facing message when the model produced no answer text at all (e.g. a
+# reasoning model burned its output budget on thinking even on the retry).
+NO_ANSWER_FALLBACK = (
+    "I wasn't able to complete this request — the model didn't produce a final "
+    "answer. Please try sending your message again."
+)
+
+
+def _recursion_limit() -> int:
+    """Superstep (task) budget for one agent invocation.
+
+    The graph is pre_model_hook -> agent -> tools -> pre_model_hook -> ... so
+    every tool round-trip costs 3 tasks (agent, tools, pre_model_hook), plus
+    one initial pre_model_hook and one final agent task for the answer, plus
+    one loop tick of headroom after the last task: 3*N + 3 for N sequential
+    tool rounds (verified empirically via langgraph debug traces). With the
+    old formula (max_tool_calls + 2) only 3 sequential tool rounds fit; the
+    4th round got clobbered by langgraph's "Sorry, need more steps" guard
+    mid-flow, which surfaced as a missing answer. An (N+1)th round attempt is
+    still intercepted gracefully by that guard instead of crashing with
+    GraphRecursionError.
+    """
+    return settings.max_tool_calls * 3 + 3
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -807,7 +831,7 @@ def chat(
     config: dict[str, Any] = {
         "configurable": {"thread_id": req.thread_id, "account_id": account_id},
         "metadata": {"account_id": account_id, "thread_id": req.thread_id},
-        "recursion_limit": settings.max_tool_calls + 2,
+        "recursion_limit": _recursion_limit(),
     }
     graph = build_graph(settings.checkpoint_db_path)
     result, history = _run_agent(
@@ -829,6 +853,10 @@ def chat(
     if not turn_data["content"]:
         if isinstance(last_message, AIMessage) and not getattr(last_message, "tool_calls", None):
             turn_data["content"] = _message_text(last_message).strip()
+    # Never return an empty response — the UI would render a blank bubble and
+    # the user would think the agent silently stopped mid-execution.
+    if not turn_data["content"]:
+        turn_data["content"] = NO_ANSWER_FALLBACK
     store._touch_session(req.thread_id)
     response_model = _get_model_from_message(last_message) or settings.llm_model
     try:
@@ -871,7 +899,7 @@ def chat_stream(
     config: dict[str, Any] = {
         "configurable": {"thread_id": req.thread_id, "account_id": account_id},
         "metadata": {"account_id": account_id, "thread_id": req.thread_id},
-        "recursion_limit": settings.max_tool_calls + 2,
+        "recursion_limit": _recursion_limit(),
     }
 
     def _sse(event: dict[str, Any]) -> str:
@@ -1020,6 +1048,11 @@ def chat_stream(
                     fallback = _message_text(last).strip()
                     if fallback and not _is_tool_echo(fallback):
                         turn_data["content"] = fallback
+            # Never end the stream with an empty response — the UI would
+            # render a blank bubble and the user would think the agent
+            # silently stopped mid-execution.
+            if not turn_data["content"]:
+                turn_data["content"] = NO_ANSWER_FALLBACK
             store._touch_session(req.thread_id)
             elapsed = max(__import__("time").monotonic() - start_time, 0.001)
             tps = round(total_output_tokens / elapsed, 2) if total_output_tokens > 0 else None
