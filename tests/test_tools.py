@@ -23,6 +23,7 @@ from agent.tools import (
     track_order,
     update_warehouse,
 )
+from bigship_sdk.models import RateCalculatorRequest as SDKRateCalculatorRequest
 
 
 @pytest.fixture
@@ -136,6 +137,74 @@ def test_calculate_rate() -> None:
     }
     result = calculate_rate.invoke({"payload": payload, "thread_id": "t1"})
     assert "ok" in result
+
+
+def test_calculate_rate_coerces_numeric_pincodes_and_cod() -> None:
+    """Regression: LLM emits sourcePincode/destPincode/codAmount as JSON numbers.
+
+    The SDK's RateCalculatorRequest requires those fields to be strings
+    (validated by ^[0-9]{6}$), so the tool's input shim must coerce them.
+    This mirrors the failing call from the bug report (400012 → 226018, COD).
+    """
+    from agent.tools import RateCalculatorRequest as ToolRateCalculatorRequest
+
+    raw = {
+        "segment_type": "domestic_b2c",
+        "sourcePincode": 400012,  # int, as the LLM emitted
+        "destPincode": 226018,  # int, as the LLM emitted
+        "invoiceValue": 1600.0,
+        "paymentModeId": 2,
+        "riskTypeId": 2,
+        "codAmount": 1600.0,  # float, as the LLM emitted
+        "boxes": [
+            {
+                "box_length": 20,
+                "box_width": 10,
+                "box_height": 20,
+                "box_dead_weight": 15,
+                "no_of_box": 1,
+            }
+        ],
+    }
+    shim = ToolRateCalculatorRequest.model_validate(raw)
+    assert shim.sourcePincode == "400012"
+    assert shim.destPincode == "226018"
+    assert shim.codAmount == "1600.0"
+
+    # And the dumped payload must satisfy the SDK's strict schema.
+    sdk_payload = SDKRateCalculatorRequest(**shim.model_dump(mode="json"))
+    assert sdk_payload.sourcePincode == "400012"
+    assert sdk_payload.destPincode == "226018"
+    assert sdk_payload.codAmount == "1600.0"
+
+
+def test_calculate_rate_auto_fills_cod_when_missing() -> None:
+    """When paymentModeId == 2 and codAmount is omitted, default to invoiceValue as str."""
+    from agent.tools import RateCalculatorRequest as ToolRateCalculatorRequest
+
+    raw = {
+        "segment_type": "domestic_b2c",
+        "sourcePincode": "400012",
+        "destPincode": "226018",
+        "invoiceValue": 1600.0,
+        "paymentModeId": 2,
+        "riskTypeId": 2,
+        "boxes": [
+            {
+                "box_length": 20,
+                "box_width": 10,
+                "box_height": 20,
+                "box_dead_weight": 15,
+                "no_of_box": 1,
+            }
+        ],
+    }
+    shim = ToolRateCalculatorRequest.model_validate(raw)
+    dumped = shim.model_dump(mode="json", exclude_none=True)
+    assert "codAmount" not in dumped
+    if dumped.get("codAmount") is None and dumped.get("paymentModeId") == 2:
+        dumped["codAmount"] = str(dumped["invoiceValue"])
+    SDKRateCalculatorRequest(**dumped)  # must not raise
 
 
 def test_create_order_hyperlocal() -> None:

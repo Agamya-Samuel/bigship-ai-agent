@@ -8,14 +8,14 @@ from bigship_sdk.models import (
     DomesticB2COrderRequest,
     HyperlocalOrderRequest,
     PlaceOrderRequest,
-    RateCalculatorRequest,
+    RateCalculatorRequest as _SDKRateCalculatorRequest,
     SaveWarehouseRequest,
     UpdateWarehouseRequest,
     WarehouseListRequest,
 )
 from langchain_core.tools import tool
 from langgraph.prebuilt.tool_node import ToolRuntime
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, BeforeValidator, Field
 
 from agent.credentials import get_credential_store
 
@@ -250,6 +250,33 @@ def get_risk_types(
 # ==================== RATE CALCULATOR ====================
 
 
+def _coerce_to_str(v: Any) -> Any:
+    if v is None or isinstance(v, str):
+        return v
+    return str(v)
+
+
+_StrLike = Annotated[Any, BeforeValidator(_coerce_to_str)]
+
+
+class RateCalculatorRequest(BaseModel):
+    """Input shim for the rate calculator tool.
+
+    Mirrors the SDK's ``RateCalculatorRequest`` but coerces the three fields
+    the LLM commonly emits as JSON numbers (``sourcePincode``, ``destPincode``,
+    ``codAmount``) to strings before the SDK's strict regex validation runs.
+    """
+
+    segment_type: str
+    sourcePincode: _StrLike
+    destPincode: _StrLike
+    invoiceValue: float = Field(..., gt=0)
+    paymentModeId: int
+    codAmount: _StrLike | None = None
+    riskTypeId: int
+    boxes: list[dict[str, Any]]
+
+
 @tool
 def calculate_rate(
     payload: RateCalculatorRequest,
@@ -259,18 +286,20 @@ def calculate_rate(
 
     Required fields:
     - segment_type: "domestic_b2b" or "domestic_b2c"
-    - sourcePincode: 6-digit source pincode
-    - destPincode: 6-digit destination pincode
+    - sourcePincode: 6-digit source pincode (string or int)
+    - destPincode: 6-digit destination pincode (string or int)
     - invoiceValue: invoice value (>0)
     - paymentModeId: payment mode ID
     - riskTypeId: risk type ID
-    - codAmount: optional COD amount
+    - codAmount: optional COD amount (string or number; auto-set to invoiceValue when COD + None)
     - boxes: list of boxes with box_length, box_width, box_height, box_dead_weight, no_of_box
     """
-    if payload.codAmount is None and payload.paymentModeId == 2:
-        payload.codAmount = str(payload.invoiceValue)
+    raw = payload.model_dump(mode="json", exclude_none=True)
+    if raw.get("codAmount") is None and raw.get("paymentModeId") == 2:
+        raw["codAmount"] = str(raw["invoiceValue"])
+    sdk_payload = _SDKRateCalculatorRequest(**raw)
     client = _get_client(runtime)
-    response = client.calculate_rate(payload)
+    response = client.calculate_rate(sdk_payload)
     return _format_result(response)
 
 
