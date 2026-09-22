@@ -585,11 +585,7 @@ export default function ChatPage() {
     try {
       const data = await getChatHistory(threadId)
       setMessages(
-        (data.messages || []).map((m: { role: string; content: string; steps?: AgentStep[] }) => ({
-          role: normalizeRole(m.role),
-          content: m.content,
-          steps: m.steps,
-        })),
+        (data.messages || []).map((m: ChatMessage) => normalizeChatMessage(m)),
       )
     } catch {
       setMessages([])
