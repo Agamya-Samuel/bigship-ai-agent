@@ -20,11 +20,12 @@ from bigship_sdk.models import (
     UpdateWarehouseRequest,
     WarehouseListRequest,
 )
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
+from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, SystemMessage, ToolMessage
+from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.types import RunnableConfig
 from pydantic import BaseModel
@@ -49,6 +50,19 @@ NO_ANSWER_FALLBACK = (
     "answer. Please try sending your message again."
 )
 
+NEW_CHAT_LABEL = "New chat"
+TITLE_MAX_CHARS = 60
+TITLE_MIN_WORDS = 3
+TITLE_MAX_WORDS = 8
+TITLE_INPUT_MAX_CHARS = 2000
+TITLE_GENERATION_TIMEOUT_SECONDS = 30
+TITLE_SYSTEM_PROMPT = (
+    "Create a concise title for this chat from the user's first message and the completed "
+    "assistant response. Return only the title, with no quotes, preamble, markdown, or explanation. "
+    "Use 3 to 8 words, no more than 60 characters, and focus on the task or topic rather than "
+    "reproducing credentials or unnecessary identifiers."
+)
+
 
 def _recursion_limit() -> int:
     """Superstep (task) budget for one agent invocation.
@@ -65,6 +79,95 @@ def _recursion_limit() -> int:
     GraphRecursionError.
     """
     return settings.max_tool_calls * 3 + 3
+
+
+def _truncate_title_input(value: str) -> str:
+    normalized = " ".join(str(value).split())
+    return normalized[:TITLE_INPUT_MAX_CHARS]
+
+
+def _fallback_title(user_message: str) -> str:
+    normalized = " ".join(str(user_message).split())
+    if not normalized:
+        return NEW_CHAT_LABEL
+    if len(normalized) > TITLE_MAX_CHARS:
+        truncated = normalized[:TITLE_MAX_CHARS]
+        boundary = truncated.rfind(" ")
+        normalized = truncated[:boundary] if boundary > 0 else truncated
+    return normalized.rstrip(" \t\n.,;:!?") or NEW_CHAT_LABEL
+
+
+def _sanitize_generated_title(value: str) -> str:
+    normalized = " ".join(str(value).replace("\n", " ").split()).strip().strip("\"'`")
+    if len(normalized) > TITLE_MAX_CHARS:
+        truncated = normalized[:TITLE_MAX_CHARS]
+        boundary = truncated.rfind(" ")
+        normalized = truncated[:boundary] if boundary > 0 else truncated
+    words = normalized.split()
+    if not normalized or not TITLE_MIN_WORDS <= len(words) <= TITLE_MAX_WORDS:
+        return ""
+    return normalized
+
+
+def _build_title_llm() -> ChatOpenAI:
+    return ChatOpenAI(
+        model=settings.llm_model,
+        openai_api_base="https://openrouter.ai/api/v1",
+        openai_api_key=settings.openrouter_api_key,
+        temperature=0,
+        max_tokens=30,
+        timeout=TITLE_GENERATION_TIMEOUT_SECONDS,
+    )
+
+
+def _generate_title_after_turn(
+    thread_id: str,
+    user_message: str,
+    assistant_response: str,
+) -> str | None:
+    store = _store()
+    fallback = _fallback_title(user_message)
+    try:
+        if not store.claim_title_generation(thread_id):
+            return None
+    except Exception as exc:
+        logger.warning(
+            "Title claim failed for thread_id=%s: %s",
+            thread_id,
+            exc.__class__.__name__,
+        )
+        return None
+
+    try:
+        llm = _build_title_llm()
+        user_excerpt = _truncate_title_input(user_message)
+        response_excerpt = _truncate_title_input(assistant_response)
+        result = llm.invoke(
+            [
+                SystemMessage(content=TITLE_SYSTEM_PROMPT),
+                HumanMessage(content=f"User: {user_excerpt}\nAssistant: {response_excerpt}"),
+            ]
+        )
+        title = _sanitize_generated_title(str(result.content)) or fallback
+    except Exception as exc:
+        logger.warning(
+            "Title generation failed for thread_id=%s: %s",
+            thread_id,
+            exc.__class__.__name__,
+        )
+        title = fallback
+
+    try:
+        if not store.complete_title_generation(thread_id, title):
+            return None
+    except Exception as exc:
+        logger.warning(
+            "Title persistence failed for thread_id=%s: %s",
+            thread_id,
+            exc.__class__.__name__,
+        )
+        return None
+    return title
 
 
 @asynccontextmanager
@@ -93,7 +196,7 @@ def _default_thread_id(store: EncryptedCredentialStore, account_id: str) -> str:
     if sessions:
         return str(sessions[0]["thread_id"])
     thread_id = uuid.uuid4().hex
-    store.create_session(account_id, thread_id, "Default")
+    store.create_session(account_id, thread_id, "New chat")
     return thread_id
 
 
@@ -816,6 +919,7 @@ def _run_agent(  # type: ignore[no-untyped-def]
 @app.post("/chat", response_model=ChatResponse)
 def chat(
     req: ChatRequest,
+    background_tasks: BackgroundTasks,
     account_id: str = Depends(get_current_account),
 ) -> ChatResponse:
     store = _store()
@@ -828,6 +932,7 @@ def chat(
     store.get_or_create_client(req.thread_id)
 
     history = _get_history(req.thread_id, settings.checkpoint_db_path, store)
+    is_first_turn = not history
     config: dict[str, Any] = {
         "configurable": {"thread_id": req.thread_id, "account_id": account_id},
         "metadata": {"account_id": account_id, "thread_id": req.thread_id},
@@ -878,6 +983,13 @@ def chat(
         )
     except Exception:  # noqa: BLE001
         pass
+    if is_first_turn:
+        background_tasks.add_task(
+            _generate_title_after_turn,
+            req.thread_id,
+            req.message,
+            turn_data["content"],
+        )
     return ChatResponse(response=turn_data["content"], steps=turn_data["steps"], model=response_model)
 
 
@@ -895,6 +1007,7 @@ def chat_stream(
         )
     store.get_or_create_client(req.thread_id)
     history = _get_history(req.thread_id, settings.checkpoint_db_path, store)
+    is_first_turn = not history
     graph = build_graph(settings.checkpoint_db_path)
     config: dict[str, Any] = {
         "configurable": {"thread_id": req.thread_id, "account_id": account_id},
@@ -1080,6 +1193,22 @@ def chat_stream(
                     "model": response_model,
                 }
             )
+            if is_first_turn:
+                try:
+                    title = _generate_title_after_turn(
+                        req.thread_id,
+                        req.message,
+                        turn_data["content"],
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Title generation failed for thread_id=%s: %s",
+                        req.thread_id,
+                        exc.__class__.__name__,
+                    )
+                    title = None
+                if title:
+                    yield _sse({"type": "title", "thread_id": req.thread_id, "title": title})
         except Exception as exc:  # noqa: BLE001
             logger.exception("Streaming chat failed for thread_id=%s", req.thread_id)
             if _is_rate_limit_error(exc):

@@ -5,7 +5,7 @@ import os
 import sqlite3
 import threading
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import bcrypt as _bcrypt
@@ -52,13 +52,15 @@ class EncryptedCredentialStore:
                 id TEXT PRIMARY KEY,
                 account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
                 thread_id TEXT UNIQUE NOT NULL,
-                label TEXT DEFAULT '',
+                label TEXT NOT NULL DEFAULT 'New chat',
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 last_used_at TEXT NOT NULL DEFAULT (datetime('now')),
                 model TEXT,
                 last_tokens INTEGER,
                 last_tps REAL,
-                last_timestamp TEXT
+                last_timestamp TEXT,
+                title_status TEXT NOT NULL DEFAULT 'pending',
+                title_attempted_at TEXT
             );
 
             CREATE INDEX IF NOT EXISTS idx_sessions_account_id
@@ -77,6 +79,8 @@ class EncryptedCredentialStore:
             ("last_tokens", "INTEGER"),
             ("last_tps", "REAL"),
             ("last_timestamp", "TEXT"),
+            ("title_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("title_attempted_at", "TEXT"),
         ]
         for column, column_type in migrations:
             if column not in columns:
@@ -84,6 +88,28 @@ class EncryptedCredentialStore:
                     self._conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} {column_type}")
                 except Exception:  # noqa: BLE001
                     pass
+        self._conn.commit()
+
+        columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(sessions)").fetchall()}
+        if "title_status" not in columns or "title_attempted_at" not in columns:
+            return
+
+        cutoff = (datetime.now(UTC) - timedelta(minutes=5)).isoformat(timespec="seconds")
+        self._conn.execute(
+            "UPDATE sessions SET title_status = 'pending', title_attempted_at = NULL "
+            "WHERE title_status = 'generating' "
+            "AND (title_attempted_at IS NULL OR title_attempted_at <= ?)",
+            (cutoff,),
+        )
+        self._conn.execute(
+            "UPDATE sessions SET label = 'New chat', title_status = 'pending', title_attempted_at = NULL "
+            "WHERE label IS NULL OR TRIM(label) = ''",
+        )
+        self._conn.execute(
+            "UPDATE sessions SET title_status = 'custom' "
+            "WHERE label IS NOT NULL AND TRIM(label) <> '' AND label <> 'New chat' "
+            "AND title_status <> 'custom'",
+        )
         self._conn.commit()
 
     def _encrypt(self, plaintext: str) -> str:
@@ -158,16 +184,17 @@ class EncryptedCredentialStore:
             raise SessionNotFoundError(f"Account not found: {account_id}")
         return dict(row)
 
-    def create_session(self, account_id: str, thread_id: str, label: str = "") -> None:
+    def create_session(self, account_id: str, thread_id: str, label: str = "New chat") -> None:
+        normalized_label = label.strip() or "New chat"
+        title_status = "pending" if normalized_label == "New chat" else "custom"
         with self._lock:
             session_id = self._generate_id()
             self._conn.execute(
-                "INSERT INTO sessions (id, account_id, thread_id, label) VALUES (?, ?, ?, ?)",
-                (session_id, account_id, thread_id, label),
+                "INSERT INTO sessions (id, account_id, thread_id, label, title_status) VALUES (?, ?, ?, ?, ?)",
+                (session_id, account_id, thread_id, normalized_label, title_status),
             )
             self._conn.commit()
         self._touch_session(thread_id)
-
     def get_sessions(self, account_id: str) -> list[dict[str, Any]]:
         with self._lock:
             rows = self._conn.execute(
@@ -269,6 +296,45 @@ class EncryptedCredentialStore:
                 (model, thread_id),
             )
             self._conn.commit()
+
+    def update_session_label(self, thread_id: str, label: str) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE sessions SET label = ? WHERE thread_id = ?",
+                (label.strip() or "New chat", thread_id),
+            )
+            self._conn.commit()
+
+    def claim_title_generation(self, thread_id: str) -> bool:
+        cutoff = (datetime.now(UTC) - timedelta(minutes=5)).isoformat(timespec="seconds")
+        attempted_at = datetime.now(UTC).isoformat(timespec="seconds")
+        with self._lock:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                cursor = self._conn.execute(
+                    "UPDATE sessions SET title_status = 'generating', title_attempted_at = ? "
+                    "WHERE thread_id = ? AND label = 'New chat' "
+                    "AND (title_status = 'pending' OR "
+                    "(title_status = 'generating' AND title_attempted_at IS NOT NULL "
+                    "AND title_attempted_at <= ?))",
+                    (attempted_at, thread_id, cutoff),
+                )
+                claimed = cursor.rowcount == 1
+                self._conn.commit()
+                return claimed
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def complete_title_generation(self, thread_id: str, label: str) -> bool:
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE sessions SET label = ?, title_status = 'generated', title_attempted_at = NULL "
+                "WHERE thread_id = ? AND title_status = 'generating' AND label = 'New chat'",
+                (label.strip() or "New chat", thread_id),
+            )
+            self._conn.commit()
+            return cursor.rowcount == 1
 
     def update_session_metrics(
         self,
