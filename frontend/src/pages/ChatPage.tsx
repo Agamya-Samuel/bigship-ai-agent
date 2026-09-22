@@ -653,7 +653,7 @@ export default function ChatPage() {
                         )}
                         {msg.model && (
                           <p className="text-[10px] text-(--text-tertiary)">
-                            {msg.model}
+                            {msg.model.replace(/:free$/, '')}
                           </p>
                         )}
                         {msg.timestamp && (
