@@ -1,23 +1,9 @@
-import { Outlet, Link, useNavigate } from '@tanstack/react-router'
+import { Outlet, useNavigate } from '@tanstack/react-router'
 import { useState, useEffect } from 'react'
-import {
-  Package,
-  Warehouse,
-  Calculator,
-  User,
-  LogOut,
-  Menu,
-} from 'lucide-react'
+import { LogOut, Menu } from 'lucide-react'
 import { logout } from '../lib/api'
 import { ThemeToggle } from './ThemeToggle'
 import { BrandIcon } from './ui/BrandIcon'
-
-const navItems = [
-  { to: '/orders', icon: Package, label: 'Orders' },
-  { to: '/warehouses', icon: Warehouse, label: 'Warehouses' },
-  { to: '/rate-calculator', icon: Calculator, label: 'Rate Calculator' },
-  { to: '/profile', icon: User, label: 'Profile' },
-]
 
 export default function DashboardLayout() {
   const navigate = useNavigate()
@@ -49,20 +35,6 @@ export default function DashboardLayout() {
           <span className="text-sm font-semibold tracking-wide text-(--text-primary)">BIGSHIP</span>
         </div>
       </div>
-      <nav className="flex-1 p-3 space-y-1">
-        {navItems.map((item) => (
-          <Link
-            key={item.to}
-            to={item.to}
-            activeProps={{ className: 'bg-(--accent)/10 text-(--accent)' }}
-            inactiveProps={{ className: 'text-(--text-secondary) hover:bg-(--bg-tertiary) hover:text-(--accent)' }}
-            className="flex items-center gap-3 px-3 py-2.5 text-xs uppercase tracking-widest transition-colors"
-          >
-            <item.icon className="w-4 h-4" />
-            <span>{item.label}</span>
-          </Link>
-        ))}
-      </nav>
       <div className="p-3 border-t border-(--border-primary)">
         <button
           onClick={handleLogout}
