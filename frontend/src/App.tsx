@@ -1,12 +1,9 @@
 import { RouterProvider } from '@tanstack/react-router'
-import { useEffect } from 'react'
+import { useTheme } from './hooks/useTheme'
 import { router } from './routes/routeTree.gen'
 
 export default function App() {
-  useEffect(() => {
-    const theme = localStorage.getItem('theme') as 'dark' | 'light' | null
-    document.documentElement.setAttribute('data-theme', theme ?? 'light')
-  }, [])
+  useTheme()
 
   return <RouterProvider router={router} />
 }
