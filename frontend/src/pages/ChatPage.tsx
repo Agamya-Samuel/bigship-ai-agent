@@ -155,6 +155,30 @@ function CopyButton({ text }: { text: string }) {
   )
 }
 
+function TypingLabel({ text, active }: { text: string; active: boolean }) {
+  const [displayed, setDisplayed] = useState(text)
+  const prevTextRef = useRef(text)
+  useEffect(() => {
+    if (!active) {
+      setDisplayed(text)
+      prevTextRef.current = text
+      return
+    }
+    const prev = prevTextRef.current
+    if (text === prev) return
+    let i = prev.length
+    setDisplayed(prev)
+    prevTextRef.current = text
+    const timer = setInterval(() => {
+      i += 1
+      setDisplayed(text.slice(0, i))
+      if (i >= text.length) clearInterval(timer)
+    }, 28)
+    return () => clearInterval(timer)
+  }, [text, active])
+  return <>{displayed || text}</>
+}
+
 function ReasoningChip({ text, live, isLatest }: { text: string; live?: boolean; isLatest?: boolean }) {
   const [open, setOpen] = useState(false)
   useEffect(() => {
@@ -452,7 +476,7 @@ function SidebarContent({
               >
                 <MessageSquare className={`h-4.75 w-3.5 shrink-0 ${active ? 'text-white/80' : 'opacity-60'}`} />
                 <div className="min-w-0 flex-1">
-                  <div className="truncate text-[13px] font-medium">{session.label || 'Chat'}</div>
+                  <TypingLabel text={session.label || 'Chat'} active={active} />
                   <time
                     dateTime={timestampValue ? new Date(timestampValue).toISOString() : undefined}
                     className={`mt-0.5 block text-[10px] leading-tight ${active ? 'text-white/65' : 'text-[var(--text-tertiary)]'}`}
@@ -513,6 +537,8 @@ export default function ChatPage() {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
 
   const userName = localStorage.getItem('user_name') || 'User'
+  const activeSession = sessions.find((session) => session.thread_id === activeThreadId)
+  const activeTitle = activeSession?.label || 'New chat'
 
   useEffect(() => {
     const mq = window.matchMedia('(min-width: 768px)')
@@ -536,7 +562,7 @@ export default function ChatPage() {
         if (prev.some((s) => s.thread_id === urlThreadId)) return prev
         return [
             ...prev,
-            { id: '', thread_id: urlThreadId, label: 'Chat', created_at: '', last_used_at: '' },
+            { id: '', thread_id: urlThreadId, label: 'New chat', created_at: '', last_used_at: '' },
           ]
       })
     }
@@ -588,7 +614,12 @@ export default function ChatPage() {
   const loadSessions = async () => {
     try {
       const data = await getSessions()
-      setSessions(data.sessions)
+      setSessions(
+        data.sessions.map((session) => ({
+          ...session,
+          label: session.label || 'New chat',
+        })),
+      )
       const effectiveThreadId =
         urlThreadId ||
         activeThreadId ||
@@ -693,6 +724,27 @@ export default function ChatPage() {
       const threadId = await ensureThreadId()
       if (!threadId) return
       await streamChat(threadId, userMessage, (ev) => {
+        if (ev.type === 'title') {
+          setSessions((prev) => {
+            const index = prev.findIndex((session) => session.thread_id === ev.thread_id)
+            if (index >= 0) {
+              const next = [...prev]
+              next[index] = { ...next[index], label: ev.title }
+              return next
+            }
+            return [
+              ...prev,
+              {
+                id: '',
+                thread_id: ev.thread_id,
+                label: ev.title,
+                created_at: '',
+                last_used_at: '',
+              },
+            ]
+          })
+          return
+        }
         if (ev.type === 'done' || ev.type === 'error') setStreamingActive(false)
         setMessages((prev) => {
           if (prev.length === 0) return prev
@@ -900,7 +952,7 @@ export default function ChatPage() {
               <Menu className="h-4 w-4" />
             </IconButton>
             <span className="text-sm font-medium text-[var(--text-primary)] ml-1 truncate">
-              {messages.length > 0 ? 'Bigship Agent' : 'New chat'}
+              <TypingLabel text={messages.length > 0 ? activeTitle : 'New chat'} active={messages.length > 0} />
             </span>
           </div>
           <div className="flex items-center gap-1">
