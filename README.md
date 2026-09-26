@@ -2,6 +2,12 @@
 
 FastAPI microservice that exposes a LangGraph + LangChain agent for the Bigship dashboard. The agent uses the `bigship-sdk` to call Bigship API methods step-by-step, with per-chat-session memory via `SqliteSaver` and encrypted credential storage via `EncryptedCredentialStore`.
 
+## Demo in action
+
+<video src="https://cdn-r2.agamya.dev/bigship/bigship-ai-agent-demo.mp4" autoplay muted loop playsinline controls preload="metadata"></video>
+
+> Can't play the embed? [Watch the demo](https://cdn-r2.agamya.dev/bigship/bigship-ai-agent-demo.mp4).
+
 ## Layout
 
 ```
@@ -55,13 +61,6 @@ Frontend:
 
 ```bash
 cd frontend && npm run dev   # VITE_API_URL=http://localhost:8000
-```
-
-## Run
-
-```bash
-uv run uvicorn agent.service:app --port 8000
-# or: uv run bigship-agent
 ```
 
 ## API
