@@ -2,28 +2,31 @@
 
 FastAPI microservice that exposes a LangGraph + LangChain agent for the Bigship dashboard. The agent uses the `bigship-sdk` to call Bigship API methods step-by-step, with per-chat-session memory via `SqliteSaver` and encrypted credential storage via `EncryptedCredentialStore`.
 
-## Architecture
+## Layout
 
 ```
-Bigship Dashboard  →  HTTP  →  Agent Service (FastAPI + LangGraph)
-                                           │
-                                    SqliteSaver (per-thread memory)
-                                    EncryptedCredentialStore (encrypted at-rest)
-                                           │
-                                    bigship-sdk (individual method calls)
-                                           │
-                                    Bigship Unified Outbound API
+bigship-ai-agent/
+  agent/        # backend: FastAPI + LangGraph (mirrors frontend/)
+  frontend/     # Vite + React SPA (node build → nginx serve)
+  tests/        # pytest suite (pythonpath=["."])
+  data/         # SQLite volume mount (git-ignored except .gitkeep)
+  docs/         # ENV.md, DEPLOY.md
+  scripts/      # smoke.sh, backup.sh
+  Dockerfile
+  docker-compose.yml
 ```
 
 ## Setup
 
 ```bash
-# Install the Bigship SDK in editable mode
-pip install -e /run/media/agamya/Storage/BigShip/bigship-sdk-python
-
-# Install project dependencies
+# Backend deps (bigship-sdk pinned to GitHub commit in pyproject.toml)
 uv sync --group dev
+
+# Frontend deps
+cd frontend && npm ci
 ```
+
+See `docs/DEPLOY.md` for VPS deploy and `docs/ENV.md` for variables.
 
 ## Environment
 
@@ -31,29 +34,46 @@ uv sync --group dev
 |---|---|---|
 | `OPENROUTER_API_KEY` | (required) | OpenRouter API key |
 | `LLM_MODEL` | (required) | Model to use via OpenRouter |
-| `AGENT_PORT` | `8000` | Port for the FastAPI service |
-| `CHECKPOINT_DB_PATH` | `./checkpoints.db` | SQLite checkpoint database path |
-| `MAX_TOOL_CALLS` | `10` | Max recursive tool calls per turn |
-| `AGENT_SERVICE_API_KEY` | (optional) | Service-level API key; when set, all endpoints require `X-Service-Api-Key` |
+| `JWT_SECRET` | (required) | HS256 signing secret |
 | `CREDENTIAL_ENCRYPTION_KEY` | (required) | Base64-encoded 32-byte Fernet key for encrypting stored merchant credentials |
+| `FRONTEND_ORIGIN` | `http://localhost:5173` | Comma-separated CORS origins, e.g. `https://app.example.com` |
+| `CHECKPOINT_DB_PATH` | `/data/checkpoints.db` | SQLite checkpoint database path (compose mounts `./data:/data`; local override `./checkpoints.db`) |
+| `AGENT_PORT` | `8000` | Port for the FastAPI service |
+| `MAX_TOOL_CALLS` | `10` | Max recursive tool calls per turn |
+| `JWT_EXPIRY_MINUTES` | `1440` | Login token TTL |
+
+Frontend build-time: `VITE_API_URL` — empty = same-origin via nginx proxy (recommended prod), `http://localhost:8000` local, or `https://api.example.com` split-domain.
 
 ## Run
 
 ```bash
-OPENROUTER_API_KEY=... \
-CREDENTIAL_ENCRYPTION_KEY=... \
-uv run uvicorn src.agent.main:app --port 8000
+uv run uvicorn agent.service:app --port 8000
+# or: uv run bigship-agent
+```
+
+Frontend:
+
+```bash
+cd frontend && npm run dev   # VITE_API_URL=http://localhost:8000
+```
+
+## Run
+
+```bash
+uv run uvicorn agent.service:app --port 8000
+# or: uv run bigship-agent
 ```
 
 ## API
 
-All endpoints require the header `X-Service-Api-Key` when `AGENT_SERVICE_API_KEY` is configured.
-
 | Method | Path | Body | Description |
 |---|---|---|---|
-| POST | `/account/session` | `{thread_id, user_name, password, access_key}` | Create or update a merchant account and start a chat session |
-| POST | `/session/end` | `{thread_id}` | End a merchant session and evict cached credentials |
+| POST | `/auth/login` | `{user_name, password, access_key}` | Login / create merchant account, returns JWT |
+| POST | `/auth/logout` | — | Evict cached client (Bearer required) |
+| GET | `/auth/me` | — | Current account info (Bearer required) |
+| GET/POST/DELETE | `/sessions...` | | Chat session CRUD (Bearer required) |
 | POST | `/chat` | `{thread_id, message}` | Send a chat message; returns the agent's response |
+| POST | `/chat/stream` | `{thread_id, message}` | SSE-streamed chat |
 | GET | `/health` | — | Liveness check |
 
 ## Agent Tools
@@ -83,10 +103,10 @@ The agent exposes 15 tools derived from the Bigship SDK:
 uv run pytest tests/ -v
 
 # Lint
-uv run ruff check src/
+uv run ruff check agent/ tests/
 
 # Typecheck
-uv run mypy src/
+uv run mypy agent/
 ```
 
 ## Security

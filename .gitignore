@@ -34,14 +34,23 @@ coverage.xml
 # Logs
 *.log
 
-# Project-specific
+# Project-specific — SQLite runtime files (persisted via ./data volume in prod)
 checkpoints.db
+checkpoints.db-shm
+checkpoints.db-wal
 *.db
+*.db-shm
+*.db-wal
+!data/.gitkeep
+data/backups/
 
 # Environment
 .env
 .env.*
 !.env.example
+frontend/.env
+frontend/.env.*
+!frontend/.env.example
 
 # IDE
 .commandcode/

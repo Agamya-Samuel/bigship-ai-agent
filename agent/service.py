@@ -172,7 +172,11 @@ def _generate_title_after_turn(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    init_credential_store(settings.checkpoint_db_path)
+    db_path = settings.checkpoint_db_path
+    parent = Path(db_path).expanduser().parent
+    if str(parent) not in ("", "."):
+        parent.mkdir(parents=True, exist_ok=True)
+    init_credential_store(db_path)
     yield
 
 
@@ -180,7 +184,7 @@ app = FastAPI(title="Bigship AI Agent", version="0.2.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[settings.frontend_origin],
+    allow_origins=settings.frontend_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1406,7 +1410,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-_frontend_dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+_frontend_dist = Path(__file__).resolve().parent.parent / "frontend" / "dist"
 
 
 @app.exception_handler(404)

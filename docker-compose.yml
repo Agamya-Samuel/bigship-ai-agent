@@ -1,0 +1,46 @@
+name: bigship-ai-agent
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: bigship-ai-agent-api:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # CHECKPOINT_DB_PATH defaults to /data/checkpoints.db in code;
+      # keep it unset here so local `.env` (./checkpoints.db) doesn't leak
+      # absolute-container paths, and prod sets it explicitly.
+      CHECKPOINT_DB_PATH: ${CHECKPOINT_DB_PATH:-/data/checkpoints.db}
+    volumes:
+      - ./data:/data
+    expose:
+      - "8000"
+    # Publish directly for split-domain deploys. Behind a reverse proxy
+    # that routes /api/* to the backend, keep this unpublished instead.
+    ports:
+      - "${AGENT_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        # Empty → same-origin via nginx proxy (no CORS needed).
+        # Direct backend URL → e.g. https://api.example.com
+        VITE_API_URL: ${VITE_API_URL:-}
+    image: bigship-ai-agent-web:latest
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "${WEB_PORT:-3000}:80"

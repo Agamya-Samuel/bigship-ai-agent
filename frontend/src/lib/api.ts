@@ -1,7 +1,7 @@
 import axios from 'axios'
 import type { LoginRequest, LoginResponse, SessionListResponse, ChatResponse, StreamEvent } from '../types'
 
-const API_BASE = import.meta.env.VITE_API_URL || '/'
+const API_BASE = (import.meta.env.VITE_API_URL ?? '').toString().replace(/\/+$/, '')
 
 export const api = axios.create({
   baseURL: API_BASE,

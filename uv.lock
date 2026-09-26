@@ -211,7 +211,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "bcrypt", specifier = ">=4.0" },
-    { name = "bigship-sdk", directory = "/run/media/agamya/Storage/BigShip/bigship-sdk-python" },
+    { name = "bigship-sdk", git = "https://github.com/Agamya-Samuel/bigship-sdk-python.git?rev=173b126d8038e372fca2ce23d1a8ba94067c351f" },
     { name = "cryptography", specifier = ">=42" },
     { name = "fastapi", specifier = ">=0.110.0" },
     { name = "langchain-openai", specifier = ">=0.2.0" },
@@ -235,33 +235,10 @@ dev = [
 [[package]]
 name = "bigship-sdk"
 version = "0.1.0"
-source = { directory = "/run/media/agamya/Storage/BigShip/bigship-sdk-python" }
+source = { git = "https://github.com/Agamya-Samuel/bigship-sdk-python.git?rev=173b126d8038e372fca2ce23d1a8ba94067c351f#173b126d8038e372fca2ce23d1a8ba94067c351f" }
 dependencies = [
     { name = "httpx" },
     { name = "pydantic" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.11" },
-    { name = "pydantic", specifier = ">=2.0" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "respx", marker = "extra == 'dev'", specifier = ">=0.21" },
-    { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.6" },
-    { name = "uv", marker = "extra == 'dev'", specifier = ">=0.4" },
-]
-provides-extras = ["dev"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.11" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.23" },
-    { name = "respx", specifier = ">=0.21" },
-    { name = "ruff", specifier = ">=0.6" },
-    { name = "uv", specifier = ">=0.4" },
 ]
 
 [[package]]
