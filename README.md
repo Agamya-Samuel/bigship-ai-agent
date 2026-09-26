@@ -4,9 +4,9 @@ FastAPI microservice that exposes a LangGraph + LangChain agent for the Bigship 
 
 ## Demo in action
 
-<video src="https://cdn-r2.agamya.dev/bigship/bigship-ai-agent-demo.mp4" autoplay muted loop playsinline controls preload="metadata"></video>
+[![Bigship AI Agent demo](docs/bigship-ai-agent-demo.gif)](https://cdn-r2.agamya.dev/bigship/bigship-ai-agent-demo.mp4)
 
-> Can't play the embed? [Watch the demo](https://cdn-r2.agamya.dev/bigship/bigship-ai-agent-demo.mp4).
+> Click the animation to watch the full video. GitHub doesn't render inline `<video>` embeds for external URLs, so this is an animated preview.
 
 ## Layout
 
